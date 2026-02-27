@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: emma_mcp
+Version: 0.1.0
+Summary: A standard python package with client and server
+Author-email: Meng Zhao <zhaomenq@physik.hu-berlin.de>
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Dynamic: license-file
+
+# EMMA_MCP
+An event-driven, multi-agent workflow framework built on FastMCP for structured and robust tool orchestration.
