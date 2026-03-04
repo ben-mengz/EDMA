@@ -1,3 +1,0 @@
-[console_scripts]
-emma-client = emma_mcp.client:main
-emma-server = emma_mcp.server:main
