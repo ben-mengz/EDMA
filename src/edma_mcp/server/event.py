@@ -1,13 +1,13 @@
 import json
 import time
 import threading
-import asyncio
 from collections import deque
 from dataclasses import dataclass, asdict
 from typing import Any, Deque, Dict, List, Optional
-from pydantic import BaseModel
-from fastmcp import Context
+from urllib.parse import urlparse, parse_qs
 from edma_mcp.server.base import BaseMCP
+from pydantic import BaseModel
+from fastmcp import  Context
 
 
 @dataclass(frozen=True)
@@ -55,7 +55,15 @@ class _EventBus:
                 events = [asdict(e) for e in self._events if e.cursor > after]
             return {"next_cursor": newest, "events": events}
 
-
+    @staticmethod
+    def json_safe(obj: Any) -> Any:
+        if isinstance(obj, set):
+            return list(obj)
+        if isinstance(obj, dict):
+            return {k: EventMCP.json_safe(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [EventMCP.json_safe(v) for v in obj]
+        return obj
 class EventPushArgs(BaseModel):
     agent: str
     event_type: str
@@ -70,7 +78,7 @@ class EventReadArgs(BaseModel):
 class EventMCP(BaseMCP):
     """
     A single internal MCP instance that stores and broadcasts events.
-    Intended to be used by the client-plugin/dispatcher.
+    Intended to be used by your client-plugin/dispatcher, not exposed to the LLM.
     """
 
     def __init__(self, max_events: int = 5000) -> None:
@@ -85,38 +93,47 @@ class EventMCP(BaseMCP):
         self._bus = _EventBus(maxlen=max_events)
         self._session_lock = threading.RLock()
         self._sessions: set[Any] = set()
-        self._event_mcp = self
-        self._set_up_resources()
+        self._set_up_ui_resources()
         self._set_up_tools()
+        self._event_mcp = self
 
-    def _set_up_resources(self) -> None:
+    def _set_up_ui_resources(self) -> None:
+        # English comment: Use path parameters, not query string.
         @self.mcp.resource(f"{self._resource_uri}/{{scope}}/{{after}}")
         def read_all_events(scope: str, after: str) -> str:
             """
             Resource returns JSON:
               - next_cursor: int
               - events: list[{cursor, ts, agent, event_type, payload, targets}]
+
+            Incremental reads:
+              {base}/{scope}/{after}
+            Example:
+              events://hub/all/agent_suggestion/0
+              events://hub/all/agent_suggestion/42
             """
             try:
                 after_i = int(after)
             except Exception:
                 after_i = 0
 
-            data = self._bus.read_after(after=after_i, scope=None)
+            # Optional: filter by scope (agent) if you want
+            # If you do NOT want filtering, just ignore scope.
+            data = self._bus.read_after(after=after_i,scope=None)
+            print(data)
+
             return json.dumps(data, ensure_ascii=False)
 
     def _set_up_tools(self) -> None:
         @self.mcp.tool()
-        async def events_push(
-            ctx: Context,
-            agent: str,
-            event_type: str,
-            payload: Dict[str, Any] = {},
-            targets: Optional[List[str]] = None
-        ) -> str:
+        async def events_push(ctx:Context,    agent: str,
+                            event_type: str,
+                            payload: Dict[str, Any] = {},
+                            targets: Optional[List[str]] = None) -> str:
             """
             Push an event to the hub and notify subscribers that the resource updated.
             """
+            
             item = self._bus.append(
                 agent=agent,
                 event_type=event_type,
@@ -125,8 +142,8 @@ class EventMCP(BaseMCP):
             )
 
             await self._notify_resource_updated(ctx, self._resource_uri)
-            return json.dumps({"ok": True, "cursor": item.cursor}, ensure_ascii=False)
 
+            return json.dumps({"ok": True, "cursor": item.cursor}, ensure_ascii=False)
         @self.mcp.tool()
         async def events_subscribe(ctx: Context) -> str:
             session = getattr(ctx, "session", None)
@@ -157,6 +174,7 @@ class EventMCP(BaseMCP):
         if callable(send_notification):
             try:
                 ResourceUpdatedNotification = None
+
                 try:
                     from mcp.types import ResourceUpdatedNotification as _R  # type: ignore
                     ResourceUpdatedNotification = _R
@@ -208,15 +226,14 @@ class EventMCP(BaseMCP):
                 for s in dead:
                     self._sessions.discard(s)
 
-    def append_local(
-        self,
-        agent: str,
-        event_type: str,
-        payload: Dict[str, Any],
-        targets: Optional[List[str]] = None
-    ) -> int:
+    def append_local(self, agent: str, event_type: str, payload: Dict[str, Any], targets: Optional[List[str]] = None) -> int:
+        """
+        Append an event without notifying any subscribers.
+        Use events_push tool if you need notifications.
+        """
         item = self._bus.append(agent=agent, event_type=event_type, payload=payload, targets=targets)
         return item.cursor
+    
 
     async def push_event(
         self,
@@ -226,15 +243,40 @@ class EventMCP(BaseMCP):
         agent: Optional[str] = None,
         targets: Optional[List[str]] = None,
     ) -> None:
-        self.append_local(
+        """
+        Push an event to the internal EventMCP.
+
+        This method is NOT a tool and is never exposed to the LLM.
+        It is intended to be called from server-side logic only
+        (UI callbacks, pipeline hooks, internal state changes).
+
+        Parameters
+        ----------
+        event_type:
+            Semantic event type, e.g. "ui.selection_changed".
+        payload:
+            Arbitrary JSON-serializable payload.
+        agent:
+            Logical source agent name. Defaults to self.name.
+        targets:
+            Optional list of target agent names.
+        """
+        cursor = self.append_local(
             agent=self.name,
             event_type=event_type,
             payload=payload,
             targets=targets,
         )
-        notify_uri = f"{self._resource_uri}/all/0"
-        
-        await asyncio.wait_for(
-            self.notify_subscribers(notify_uri),
-            timeout=3.0,
-        )
+        notify_uri = f"{self._resource_uri}/{'all'}/0"
+
+        # English comment: Run async notify on the server loop safely.
+        import asyncio
+        import traceback
+        # asyncio.run_coroutine_threadsafe(
+        #     self._event_mcp.notify_subscribers(notify_uri),
+        #     self.__event_loop,
+        # )
+        result = await asyncio.wait_for(
+                self.notify_subscribers(notify_uri),
+                timeout=3.0,
+            )

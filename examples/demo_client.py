@@ -60,6 +60,13 @@ class EDMAChatApp:
         self.setup_dispatcher()
         self.start_listener()
         
+        # Periodically pump the asyncio loop so that Main Thread calls from ThreadHelper get executed
+        def pump_loop():
+            self.dummy_loop.call_soon(self.dummy_loop.stop)
+            self.dummy_loop.run_forever()
+            self.root.after(5, pump_loop)
+        self.root.after(5, pump_loop)
+        
         self.log_system("System initialized. Waiting for UI Server to send events, or type a message below...", "system")
         if not HAS_AGENTS:
             self.log_system("Warning: 'openai-agents' Python package not found. Please 'pip install openai-agents' to use the SDK.", "error")
@@ -67,7 +74,7 @@ class EDMAChatApp:
             self.log_system("OpenAI Agents SDK detected. Ready to process tool triggers/chat.", "system")
 
     def log_system(self, text: str, tag: str = "normal"):
-        """Thread-safe UI logging"""
+        """Thread-safe UI logging using ThreadHelper natively bridging to Tkinter"""
         def _log():
             self.chat_log.config(state="normal")
             prefixes = {
@@ -84,7 +91,7 @@ class EDMAChatApp:
             self.chat_log.see(tk.END)
             self.chat_log.config(state="disabled")
             
-        self.root.after(0, _log)
+        self.thread_helper.call_on_main_thread(_log)
 
     def send_manual_message(self):
         """Called when user types in the input box and hits Enter or Chat locally."""
@@ -111,19 +118,24 @@ class EDMAChatApp:
     def setup_dispatcher(self):
         @self.dispatcher.on("show")
         def handle_show(event: Dict[str, Any]):
+            print(2)
             agent = event.get('agent', 'unknown')
             msg = event.get('payload', {}).get('message', '')
+            print(f"[DEBUG UI] Received show event: {event}", flush=True)
             self.log_system(f"Received SHOW from '{agent}':\n > {msg}", "ui")
 
         @self.dispatcher.on("trigger")
         def handle_trigger(event: Dict[str, Any]):
+            print(1)
             if not HAS_AGENTS:
                 self.log_system("Cannot trigger LLM: 'agents' package missing.", "error")
+                
                 return
                 
             api_key = self.api_key_var.get().strip()
             if not api_key:
                 self.log_system("Cannot trigger LLM: API Key is empty!", "error")
+                
                 return
 
             agent = event.get('agent', 'unknown')
@@ -160,7 +172,7 @@ class EDMAChatApp:
 
             # 2. Let OpenAI Agents SDK handle everything!
             result = await Runner.run(
-                agent=triage_agent,
+                starting_agent=triage_agent,
                 input=user_message,
             )
             
@@ -178,7 +190,7 @@ class EDMAChatApp:
     def start_listener(self):
         config = EventHubConfig(
             base_url="http://127.0.0.1:7300/event_hub/", 
-            resource_base="events://all",
+            resource_base="events://hub/all",
             scope="all",
             poll_interval_sec=0.5
         )

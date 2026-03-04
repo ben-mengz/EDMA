@@ -12,11 +12,11 @@ authors = [
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "fastmcp",
-    "starlette",
-    "uvicorn",
-    "httpx",
-    "pydantic",
+    "fastmcp>=2.14.5",
+    "starlette>=0.52.1",
+    "uvicorn>=0.41.0",
+    "httpx>=0.28.1",
+    "pydantic>=2.12.5",
 ]
 
 [project.scripts]
