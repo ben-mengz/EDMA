@@ -85,3 +85,64 @@ class EDMAServer:
             server.run()
         except KeyboardInterrupt:
             print("\n[EDMAServer] Server stopped.")
+
+import threading
+import asyncio
+
+class EDMAThreadedServer:
+    """
+    A threaded orchestrator designed for non-blocking environments (like GUIs).
+    Runs the ASGI app in a background thread and avoids isatty() issues on stdout.
+    """
+    def __init__(self, host: str = "127.0.0.1", port: int = 7300, log_level: str = "info", event_hub=None):
+        self.host = host
+        self.port = port
+        self.log_level = log_level
+        self.event_hub = event_hub or EventMCP()
+        self.agents: List[BaseMCP] = []
+        
+        self._thread = None
+        self._loop = None
+        self._server = None
+
+    def add_agent(self, agent: BaseMCP) -> None:
+        if agent._event_mcp != self.event_hub:
+            agent._event_mcp = self.event_hub
+        self.agents.append(agent)
+
+    @property
+    def loop(self):
+        return self._loop
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._server is not None:
+            self._server.should_exit = True
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    def _run(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+
+        asgi_app = build_multiagent_asgi(self.agents, self.event_hub)
+        
+        config = uvicorn.Config(
+            app=asgi_app,
+            host=self.host,
+            port=self.port,
+            log_level=self.log_level,
+            log_config=None,  # Critical for custom log catchers (Nion Swift)
+            access_log=False,
+        )
+
+        self._server = uvicorn.Server(config)
+        try:
+            self._loop.run_until_complete(self._server.serve())
+        except RuntimeError:
+            pass
