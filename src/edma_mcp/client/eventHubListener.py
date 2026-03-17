@@ -88,11 +88,13 @@ class EventHubListener:
         config: EventHubConfig,
         dispatcher: EventDispatcher,
         start_cursor: int = 0,
+        skip_historical: bool = True,
     ) -> None:
         self._cfg = config
         self._dispatcher = dispatcher
 
         self._after_cursor: int = start_cursor
+        self._skip_historical: bool = skip_historical
         self._seen: Set[str] = set()
 
         self._thread: Optional[threading.Thread] = None
@@ -156,6 +158,12 @@ class EventHubListener:
                     await session.call_tool("events_subscribe", {})
                 except Exception:
                     pass
+
+                # If skip_historical is requested and cursor is 0,
+                # we perform one pull without emitting events to advance the cursor to "now".
+                if self._skip_historical and self._after_cursor == 0:
+                    data = await self._read_events(session, self._cfg.scope, 0)
+                    self._after_cursor = int(data.get("next_cursor", 0))
 
                 await self._pull_once(session)
                 backoff = self._cfg.poll_interval_sec

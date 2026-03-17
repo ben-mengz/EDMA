@@ -451,9 +451,9 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "fastmcp", specifier = "==2.14.5" },
+    { name = "fastmcp", specifier = ">=0.4.1" },
     { name = "httpx", specifier = "==0.28.1" },
-    { name = "openai-agents", specifier = "==0.10.3" },
+    { name = "openai-agents", specifier = ">=0.12.0" },
     { name = "pydantic", specifier = "==2.12.5" },
     { name = "starlette", specifier = "==0.52.1" },
     { name = "uvicorn", specifier = "==0.41.0" },
@@ -971,7 +971,7 @@ wheels = [
 
 [[package]]
 name = "openai-agents"
-version = "0.10.3"
+version = "0.12.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "griffe" },
@@ -982,9 +982,9 @@ dependencies = [
     { name = "types-requests" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ef/ed/9e6b019c659d9d98f926002304c68d3104d551b4cfec947a05e4dadc62ae/openai_agents-0.10.3.tar.gz", hash = "sha256:a54d12bd826e67f2dae428fe33e2f0137fdfe8874c5b2ba63f1951b245688abb", size = 2456278, upload-time = "2026-03-02T05:14:15.44Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/76/2e/402d3bfd6432c503bab699ece49e6febe38c64ade3365ae4fe31e7b3cba1/openai_agents-0.12.0.tar.gz", hash = "sha256:086d5cd16815d40a88231cbfd9dcca594cdf8596c6efd4859dcbafdfb31068ba", size = 2604305, upload-time = "2026-03-12T08:52:42.925Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/5b/16/b3fffdc42ef31cc66e1663ab2c7e171f1e4067197341bd68522cc3deeeb0/openai_agents-0.10.3-py3-none-any.whl", hash = "sha256:c36909ddc86af3829abbe36f39afa22221495f264b567f91373a2c2500f26729", size = 403593, upload-time = "2026-03-02T05:14:13.515Z" },
+    { url = "https://files.pythonhosted.org/packages/c1/2c/8f03b5a56329559573e692d6dc2f02c3cbbe4fcd07f9c5d81b3c280e80e7/openai_agents-0.12.0-py3-none-any.whl", hash = "sha256:24f5cc5d6213dfcda42188918ad0a739861aa505f4ef738ee07b69169faf5c09", size = 446876, upload-time = "2026-03-12T08:52:40.779Z" },
 ]
 
 [[package]]
