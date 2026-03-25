@@ -25,11 +25,12 @@ def mcp_resource(uri: str):
 
 
 class BaseMCP:
-    def __init__(self, name: str, introduction: str, prompt: str, model: str, event_mcp: Optional[Any] = None) -> None:
+    def __init__(self, name: str, introduction: str, prompt: str, model: str, event_mcp: Optional[Any] = None, reasoning_effort: Optional[str] = None) -> None:
         self.name = name
         self.introduction = introduction
         self.prompt = prompt
         self.model = model
+        self.reasoning_effort = reasoning_effort
         self.mcp = FastMCP(f"mcp-agent-{self.name}")
         self._event_mcp = event_mcp
         
@@ -47,6 +48,10 @@ class BaseMCP:
         @self.mcp.resource(f"model://{self.name}")
         def agent_model() -> str:
             return self.model
+            
+        @self.mcp.resource(f"reasoning://{self.name}")
+        def agent_reasoning_effort() -> str:
+            return self.reasoning_effort or ""
 
         self._auto_register()
 

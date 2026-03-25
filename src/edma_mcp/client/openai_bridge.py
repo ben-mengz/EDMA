@@ -6,7 +6,7 @@ from fastmcp.client import Client as FastMCPClient
 
 # Attempt to import OpenAI-specific agent framework libraries
 try:
-    from agents import Agent, CodeInterpreterTool
+    from agents import Agent, CodeInterpreterTool, ModelSettings
     from agents.tool import FunctionTool
     from agents.handoffs import handoff
     HAS_AGENTS_FRAMEWORK = True
@@ -60,11 +60,17 @@ class OpenAIMCPBridge(MCPBridgeManager):
             instructions = await self._read_agent_prompt(agent_name)
             instructions += "\nany mathematical problem you should solve with the code interpretor tool."
             
+            reasoning_str = await self._read_agent_reasoning_effort(agent_name)
+            settings_kwargs = {}
+            if reasoning_str:
+                settings_kwargs["reasoning"] = {"effort": reasoning_str}
+                
             kwargs: Dict[str, Any] = {
                 "name": agent_name,
                 "instructions": instructions,
                 "tools": tools,
-                "model": await self._read_agent_model(agent_name)
+                "model": await self._read_agent_model(agent_name),
+                "model_settings": ModelSettings(**settings_kwargs) if settings_kwargs else ModelSettings()
             }
 
             sub_agents[agent_name] = Agent(**kwargs)
@@ -283,11 +289,93 @@ class OpenAIMCPBridge(MCPBridgeManager):
         text = self._extract_resource_text(res)
         return text.strip() if isinstance(text, str) else ""
 
+    async def _read_agent_reasoning_effort(self, agent_name: str) -> str:
+        bridge = await self._get_bridge(agent_name)
+        uri = f"reasoning://{agent_name}"
+        res = await bridge.read_resource(uri)
+        text = self._extract_resource_text(res)
+        return text.strip() if isinstance(text, str) else ""
+
+    async def _generate_agents_registry_summary(self, sub_agents: Dict[str, "Agent"]) -> str:
+        """
+        Consolidate all agents' metadata (introduction and tool descriptions)
+        into a single string for the Planning Agent's context.
+        """
+        summary = "AVAILABLE AGENTS AND THEIR CAPABILITIES:\n\n"
+        for agent_name in sub_agents.keys():
+            intro = await self._read_agent_introduction(agent_name)
+            summary += f"--- Agent: {agent_name} ---\n"
+            summary += f"Description: {intro}\n"
+            
+            try:
+                bridge = await self._get_bridge(agent_name)
+                mcp_tools = await bridge.list_tools()
+                tool_specs = self._normalize_mcp_tools(mcp_tools)
+                
+                if tool_specs:
+                    summary += "Tools / Functions:\n"
+                    for spec in tool_specs:
+                        name = spec.get("name")
+                        desc = (spec.get("description") or "No description").strip()
+                        summary += f"  - {name}: {desc}\n"
+                else:
+                    summary += "Tools: None\n"
+            except Exception as e:
+                summary += f"Tools: (Error fetching tools: {e})\n"
+            
+            summary += "\n"
+        return summary
+
+    async def build_planning_agent(
+        self,
+        sub_agents: Dict[str, "Agent"],
+        *,
+        model=None,
+        reasoning_effort: Optional[str] = "high",
+        planning_instructions: Optional[str] = None,
+        planning_name: str = "planning_orchestrator",
+    ) -> "Agent":
+        """
+        Build a planning agent with knowledge of all specialist agents and their tools.
+        Note: The triage_agent handoff will be added after both agents are created to support circularity.
+        """
+        registry_summary = await self._generate_agents_registry_summary(sub_agents)
+        
+        instructions = (
+            f"{planning_instructions or ''}\n"
+            "You are the Workflow Planning Agent. Your primary role is to coordinate complex tasks.\n"
+            "1. REQUISITE KNOWLEDGE:\n"
+            f"{registry_summary}\n"
+            "2. YOUR PROCESS:\n"
+            "   - When a user makes a request, analyze it and break it down into a sequence of high-level steps.\n"
+            "   - For each step, determine which specialist agent is best suited to execute it.\n"
+            "   - You are also allowed to consult or delegate planning sub-tasks DIRECTLY to specialist agents if needed.\n"
+            "   - IMPORTANT CONSULTATION RULE: When consulting a specialist, your query MUST clearly state: 'This request is ONLY for planning purposes. Do NOT execute any concrete actions yet. Once you provide the detailed workflow, you MUST use the handoff tool to return control to the Planning Agent.'\n"
+            "   - Once the high-level plan is ready, you MUST ACTUALLY CALL the handoff tool to transfer back to the Triage Agent.\n"
+            "   - DO NOT just state that you are handing off; you MUST invoke the tool.\n"
+            "   - Once the Triage Agent returns the detailed workflows for each step, aggregate them into a single final workflow for the user.\n"
+            "3. HANDOFF ENFORCEMENT:\n"
+            "   - To send the plan back, you MUST use the handoff tool for the Triage Agent.\n"
+        )
+
+        settings_kwargs = {}
+        if reasoning_effort:
+            settings_kwargs["reasoning"] = {"effort": reasoning_effort}
+
+        return Agent(
+            name=planning_name,
+            instructions=instructions,
+            handoffs=[], # Will be populated in build_openai_system_via_fastmcp
+            model=model,
+            model_settings=ModelSettings(**settings_kwargs) if settings_kwargs else ModelSettings()
+        )
+
     async def build_triage_agent(
         self,
         sub_agents: Dict[str, "Agent"],
         *,
         model=None,
+        reasoning_effort: Optional[str] = "high",
         triage_instructions=None,
         triage_name: str = "triage",
     ) -> "Agent":
@@ -298,7 +386,15 @@ class OpenAIMCPBridge(MCPBridgeManager):
         handoffs = []
 
         for name, ag in sub_agents.items():
-            intro = await self._read_agent_introduction(name)
+            # Only attempt to read MCP metadata if the agent was discovered via MCP
+            intro = None
+            if name in self._agent_names:
+                try:
+                    intro = await self._read_agent_introduction(name)
+                except Exception:
+                    # If reading fails, just fallback to default description
+                    pass
+
             if intro:
                 desc = f"Specialist agent '{name}'.\n{intro}"
             else:
@@ -312,18 +408,33 @@ class OpenAIMCPBridge(MCPBridgeManager):
             )
 
         instructions = (
-            f"{triage_instructions or ''}"
-            "You are a triage agent.\n"
-            "Select the most appropriate specialist agent based on the user's request.\n"
-            "If a specialist exists, always hand off instead of answering yourself.\n"
-            "Please be aware that you are not allowed to answer any questions by yourself. You are only an agent to hand over jobs and summarize!" 
+            f"{triage_instructions or ''}\n"
+            "You are a triage agent and coordination specialist.\n"
+            "1. ROUTING DECISION:\n"
+            "   - If a request is simple and requires only ONE specialist, hand off DIRECTLY to that agent.\n"
+            "   - If a request is complex and involves MULTIPLE agents or steps, hand off to the Planning Agent (Orchestrator).\n"
+            "2. HANDOFF ENFORCEMENT:\n"
+            "   - You MUST ACTUALLY CALL the handoff tool for the chosen agent. Never just describe the action in text.\n"
+            "3. WORKFLOW COORDINATION (From Planning Agent):\n"
+            "   - If you receive a multi-step plan from the Planning Agent, iterate through each step.\n"
+            "   - For each step, contact the relevant specialist agent and ask: 'Provide a detailed technical workflow for this step: [step description]'.\n"
+            "   - COLLECT AND SUMMARIZE these detailed responses.\n"
+            "   - Once all steps are detailed, you MUST ACTUALLY CALL the handoff tool to return the aggregate to the Planning Agent.\n"
+            "4. IMPORTANT:\n"
+            "   - Always hand off to specialists to get their specific workflow details.\n"
+            "   - Do not make up technical details for specialists yourself."
         )
+
+        settings_kwargs = {}
+        if reasoning_effort:
+            settings_kwargs["reasoning"] = {"effort": reasoning_effort}
 
         return Agent(
             name=triage_name,
             instructions=instructions,
             handoffs=handoffs,
             model=model,
+            model_settings=ModelSettings(**settings_kwargs) if settings_kwargs else ModelSettings()
         )
 
     async def build_openai_system_via_fastmcp(
@@ -335,22 +446,63 @@ class OpenAIMCPBridge(MCPBridgeManager):
         tool_name_style: str = "plain",
         triage_name: str = "triage",
         triage_instructions: Optional[str] = None,
+        triage_reasoning_effort: Optional[str] = "high",
+        planning_name: str = "planning",
+        planning_instructions: Optional[str] = None,
+        planning_model: Optional[Any] = None,
+        planning_reasoning_effort: Optional[str] = "high",
     ) -> Tuple["Agent", Dict[str, "Agent"]]:
         """
         One-call builder:
           - discovers agents if needed
           - builds sub-agents (FastMCP transport)
-          - builds triage agent (handoff)
+          - builds planning agent (orchestrator)
+          - builds triage agent (starting point)
+        Returns (triage_agent, all_sub_agents_including_planning)
         """
+        # 1. Build basic specialist agents
         sub_agents = await self.build_openai_sub_agents_from_fastmcp(
             exclude_agents=exclude_agents,
             include_resource_list_tool=include_resource_list_tool,
             tool_name_style=tool_name_style,
         )
-        triage = await self.build_triage_agent(
+
+        # 2. Build planning agent (it needs to know about sub_agents)
+        planning = await self.build_planning_agent(
             sub_agents,
+            model=planning_model or model,
+            reasoning_effort=planning_reasoning_effort,
+            planning_name=planning_name,
+            planning_instructions=planning_instructions,
+        )
+
+        # 3. Add planning agent to the pool of sub-agents for triage
+        all_specialists = dict(sub_agents)
+        all_specialists[planning_name] = planning
+
+        # 4. Build triage agent with all sub-agents (including planning)
+        triage = await self.build_triage_agent(
+            all_specialists,
             model=model,
+            reasoning_effort=triage_reasoning_effort,
             triage_name=triage_name,
             triage_instructions=triage_instructions,
         )
-        return triage, sub_agents
+
+        # 5. Connect planning to triage and all specialist agents
+        # This allows the planning agent to consult specialists while making the plan.
+        handoffs_for_planning = [handoff(agent=triage)]
+        for name, ag in sub_agents.items():
+            handoffs_for_planning.append(handoff(agent=ag))
+        
+        planning.handoffs = handoffs_for_planning
+
+        # 6. Add return handoffs to all specialist sub-agents
+        # This allows specialists to explicitly return control to the orchestrators.
+        for name, ag in sub_agents.items():
+            if not ag.handoffs:
+                ag.handoffs = []
+            ag.handoffs.append(handoff(agent=triage))
+            ag.handoffs.append(handoff(agent=planning))
+
+        return triage, all_specialists

@@ -160,15 +160,20 @@ class EDMAChatApp:
         self.log_system("Building Multi-Agent Network via FastMCP Bridge...", "system")
         try:
             # 1. Ask bridge to assemble the Triage Agent & all Sub-Agents automatically
+            # The Triage Agent is now the main entry point, and it includes the Planning Agent
+            # as a specialist for complex task decomposition.
             triage_agent, sub_agents = await self.bridge.build_openai_system_via_fastmcp(
                 model="gpt-4o",
-                triage_name="MainRouter",
-                triage_instructions="You are the main assistant Router. Forward the request to the specialist."
+                triage_name="MainTriage",
+                planning_name="Orchestrator",
+                triage_instructions="Direct simple requests to specialists. Forward complex requests to Orchestrator.",
+                planning_instructions="Break down complex requests into high-level steps.",
+                planning_model="gpt-4o", # User requested gpt-5, using gpt-4o as the current most advanced placeholder
             )
             
             num_agents = len(sub_agents)
-            self.log_system(f"Assembled Triage agent routing across {num_agents} specialist(s).", "system")
-            self.log_system(f"Starting execution via OpenAI `Runner.run()`...", "system")
+            self.log_system(f"Assembled Triage agent routing across {num_agents} specialist(s) (including Orchestrator).", "system")
+            self.log_system(f"Starting execution via OpenAI `Runner.run()` starting with Triage Agent...", "system")
 
             # 2. Let OpenAI Agents SDK handle everything!
             result = await Runner.run(

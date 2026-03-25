@@ -84,10 +84,11 @@ class EventMCP(BaseMCP):
     def __init__(self, max_events: int = 5000) -> None:
         self._resource_uri = "events://hub/all"
         super().__init__(
-            name="event-hub",
+            name="eventhub",
             introduction="Internal event hub MCP",
             prompt="",
-            model="none",
+             model="none",
+             reasoning_effort="low",
         )
         
         self._bus = _EventBus(maxlen=max_events)
