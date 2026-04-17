@@ -68,6 +68,7 @@ class EDMAChatApp:
         self.root.after(5, pump_loop)
         
         self.log_system("System initialized. Waiting for UI Server to send events, or type a message below...", "system")
+        self.history = []
         if not HAS_AGENTS:
             self.log_system("Warning: 'openai-agents' Python package not found. Please 'pip install openai-agents' to use the SDK.", "error")
         else:
@@ -163,23 +164,30 @@ class EDMAChatApp:
             # The Triage Agent is now the main entry point, and it includes the Planning Agent
             # as a specialist for complex task decomposition.
             triage_agent, sub_agents = await self.bridge.build_openai_system_via_fastmcp(
-                model="gpt-4o",
+                model="o3-mini",
                 triage_name="MainTriage",
-                planning_name="Orchestrator",
+                orchestrator_name="Orchestrator",
                 triage_instructions="Direct simple requests to specialists. Forward complex requests to Orchestrator.",
-                planning_instructions="Break down complex requests into high-level steps.",
-                planning_model="gpt-4o", # User requested gpt-5, using gpt-4o as the current most advanced placeholder
+                orchestrator_model="o3-mini",
+                orchestrator_reasoning_effort="high",
+                playbooks_dir="src/edma_mcp/skills/playbooks",
             )
             
             num_agents = len(sub_agents)
             self.log_system(f"Assembled Triage agent routing across {num_agents} specialist(s) (including Orchestrator).", "system")
             self.log_system(f"Starting execution via OpenAI `Runner.run()` starting with Triage Agent...", "system")
 
-            # 2. Let OpenAI Agents SDK handle everything!
+            # 2. Append new message to history
+            self.history.append({"role": "user", "content": user_message})
+            
+            # 3. Let OpenAI Agents SDK handle everything!
             result = await Runner.run(
                 starting_agent=triage_agent,
-                input=user_message,
+                input=self.history,
             )
+            
+            # 4. Store the updated history (includes agent responses and tool results)
+            self.history = result.to_input_list()
             
             # 3. Output what happened
             # Typically result.final_output contains the text response

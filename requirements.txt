@@ -195,3 +195,4 @@ websockets==16.0
     # via fastmcp
 zipp==3.23.0
     # via importlib-metadata
+networkx

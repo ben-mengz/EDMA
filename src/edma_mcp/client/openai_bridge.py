@@ -1,8 +1,11 @@
 import json
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from edma_mcp.client.bridge import MCPBridgeManager
 from fastmcp.client import Client as FastMCPClient
+from edma_mcp.client.orchestrator import OrchestratorUtils, get_orchestrator_instructions
+from edma_mcp.client.models import TriageToPlanner, ExecuteStepInput, ExecuteStepOutput
 
 # Attempt to import OpenAI-specific agent framework libraries
 try:
@@ -107,6 +110,15 @@ class OpenAIMCPBridge(MCPBridgeManager):
             schema = spec.get("inputSchema") or spec.get("input_schema") or {}
             if not isinstance(schema, dict):
                 schema = {}
+
+            def sanitize_schema(s):
+                if not isinstance(s, dict): return
+                if s.get("type") == "object":
+                    s.pop("additionalProperties", None)
+                    for v in s.get("properties", {}).values():
+                        sanitize_schema(v)
+            
+            sanitize_schema(schema)
 
             openai_tools.append(
                 FunctionTool(
@@ -296,10 +308,10 @@ class OpenAIMCPBridge(MCPBridgeManager):
         text = self._extract_resource_text(res)
         return text.strip() if isinstance(text, str) else ""
 
-    async def _generate_agents_registry_summary(self, sub_agents: Dict[str, "Agent"]) -> str:
+    async def _generate_agents_registry_summary(self, sub_agents: Dict[str, "Agent"], detailed: bool = True) -> str:
         """
-        Consolidate all agents' metadata (introduction and tool descriptions)
-        into a single string for the Planning Agent's context.
+        Consolidate all agents' metadata into a single string for the Planning Agent's context.
+        If detailed=False, only agent names and intros are provided (forcing skill-reading).
         """
         summary = "AVAILABLE AGENTS AND THEIR CAPABILITIES:\n\n"
         for agent_name in sub_agents.keys():
@@ -307,21 +319,24 @@ class OpenAIMCPBridge(MCPBridgeManager):
             summary += f"--- Agent: {agent_name} ---\n"
             summary += f"Description: {intro}\n"
             
-            try:
-                bridge = await self._get_bridge(agent_name)
-                mcp_tools = await bridge.list_tools()
-                tool_specs = self._normalize_mcp_tools(mcp_tools)
-                
-                if tool_specs:
-                    summary += "Tools / Functions:\n"
-                    for spec in tool_specs:
-                        name = spec.get("name")
-                        desc = (spec.get("description") or "No description").strip()
-                        summary += f"  - {name}: {desc}\n"
-                else:
-                    summary += "Tools: None\n"
-            except Exception as e:
-                summary += f"Tools: (Error fetching tools: {e})\n"
+            if detailed:
+                try:
+                    bridge = await self._get_bridge(agent_name)
+                    mcp_tools = await bridge.list_tools()
+                    tool_specs = self._normalize_mcp_tools(mcp_tools)
+                    
+                    if tool_specs:
+                        summary += "Tools / Functions:\n"
+                        for spec in tool_specs:
+                            name = spec.get("name")
+                            desc = (spec.get("description") or "No description").strip()
+                            summary += f"  - {name}: {desc}\n"
+                    else:
+                        summary += "Tools: None\n"
+                except Exception as e:
+                    summary += f"Tools: (Error fetching tools: {e})\n"
+            else:
+                summary += "Note: Specific technical functions for this agent are hidden. You MUST read the relevant SKILL playbook to find the correct function call instructions.\n"
             
             summary += "\n"
         return summary
@@ -444,65 +459,158 @@ class OpenAIMCPBridge(MCPBridgeManager):
         exclude_agents: Optional[List[str]] = None,
         include_resource_list_tool: bool = True,
         tool_name_style: str = "plain",
-        triage_name: str = "triage",
+        triage_name: str = "MainTriage",
         triage_instructions: Optional[str] = None,
         triage_reasoning_effort: Optional[str] = "high",
-        planning_name: str = "planning",
-        planning_instructions: Optional[str] = None,
-        planning_model: Optional[Any] = None,
-        planning_reasoning_effort: Optional[str] = "high",
+        orchestrator_name: str = "Planner",
+        orchestrator_model: Optional[Any] = None,
+        orchestrator_reasoning_effort: Optional[str] = "high",
+        executive_name: str = "Executive",
+        playbooks_dir: str = "src/edma_mcp/skills/playbooks",
     ) -> Tuple["Agent", Dict[str, "Agent"]]:
         """
-        One-call builder:
-          - discovers agents if needed
-          - builds sub-agents (FastMCP transport)
-          - builds planning agent (orchestrator)
-          - builds triage agent (starting point)
-        Returns (triage_agent, all_sub_agents_including_planning)
+        Build a multi-agent system including:
+          - Triage (Entry point)
+          - Planner (Orchestrator, reads Playbooks, outputs ExecuteStepInput)
+          - Executive (Forwarder, connects Planner to Specialists)
+          - Specialists (MCP Agents)
         """
-        # 1. Build basic specialist agents
+        from edma_mcp.client.models import TriageToPlanner, ExecuteStepInput, ExecuteStepOutput, Plan
+
+        # 1. Build Specialist Agents from MCP
         sub_agents = await self.build_openai_sub_agents_from_fastmcp(
             exclude_agents=exclude_agents,
             include_resource_list_tool=include_resource_list_tool,
             tool_name_style=tool_name_style,
         )
 
-        # 2. Build planning agent (it needs to know about sub_agents)
-        planning = await self.build_planning_agent(
-            sub_agents,
-            model=planning_model or model,
-            reasoning_effort=planning_reasoning_effort,
-            planning_name=planning_name,
-            planning_instructions=planning_instructions,
+        # 2. Build Planner (Orchestrator)
+        import edma_mcp
+        package_root = os.path.dirname(os.path.dirname(edma_mcp.__file__))
+        abs_playbooks_dir = os.path.join(package_root, "edma_mcp", "skills", "playbooks")
+        
+        registry_summary = await self._generate_agents_registry_summary(sub_agents, detailed=False)
+        orchestrator_instructions = get_orchestrator_instructions(abs_playbooks_dir, registry_summary)
+        
+        settings_kwargs = {}
+        if orchestrator_reasoning_effort:
+            settings_kwargs["reasoning"] = {"effort": orchestrator_reasoning_effort}
+            
+        async def read_skill_tool(ctx, args_json: str) -> str:
+            args = json.loads(args_json) if args_json else {}
+            skill_id = args.get("skill_id")
+            return OrchestratorUtils.read_skill_content(abs_playbooks_dir, skill_id) if skill_id else "Error: skill_id is required."
+            
+        async def list_skills_tool(ctx, args_json: str) -> str:
+            return OrchestratorUtils.get_skills_catalog(abs_playbooks_dir)
+
+        planner = Agent(
+            name=orchestrator_name,
+            instructions=orchestrator_instructions,
+            model=orchestrator_model or model,
+            model_settings=ModelSettings(**settings_kwargs) if settings_kwargs else ModelSettings(),
+            tools=[
+                FunctionTool(
+                    name="list_skills",
+                    description="List all available high-level skills (Playbooks).",
+                    on_invoke_tool=list_skills_tool,
+                    params_json_schema={"type": "object", "properties": {}}
+                ),
+                FunctionTool(
+                    name="read_skill_content",
+                    description="Read the detailed step-by-step instructions for a specific skill.",
+                    on_invoke_tool=read_skill_tool,
+                    params_json_schema={
+                        "type": "object",
+                        "properties": {
+                            "skill_id": {"type": "string", "description": "The ID of the skill to read."}
+                        },
+                        "required": ["skill_id"]
+                    }
+                )
+            ],
+            handoffs=[]
         )
 
-        # 3. Add planning agent to the pool of sub-agents for triage
-        all_specialists = dict(sub_agents)
-        all_specialists[planning_name] = planning
+        # 3. Build Executive (Autonomous Loop Manager)
+        executive_instructions = (
+            "You are the Autonomous Executive (Workflow Manager).\n"
+            "1. ACCESS PLAN: You receive the full workflow plan within the shared context (WorkflowState).\n"
+            "2. LOOP EXECUTION: Based on the 'current_step_index' in the context, identify the next Specialist agent to call.\n"
+            "3. FORWARD: Use the corresponding handoff tool to the specialist. Provide precisely the 'input' and 'goal' specified in the plan.\n"
+            "4. ANALYZE & PROGRESS: When the specialist hands back to you, evaluate the 'on_success' or 'on_failure' instructions from the plan. Increment the step index or jump to fallback steps as needed.\n"
+            "5. COMPLETION: Once the plan reaches 'done' or 'stop', hand off back to the Triage Agent to present the final report.\n"
+            "RULE: You are the autonomous driver. Do NOT ask for user input. Your only handoff targets are Specialists and the Triage Agent."
+        )
+        executive = Agent(
+            name=executive_name,
+            instructions=executive_instructions,
+            model=model,
+            handoffs=[]
+        )
 
-        # 4. Build triage agent with all sub-agents (including planning)
+        # 4. Build Triage (The Entry & Review Hub)
+        triage_instructions = (
+            f"{triage_instructions or ''}\n"
+            "You are the Main Triage and Approval Hub.\n"
+            "1. PLANNING: For complex tasks, hand off to the Planner to generate a 'Plan'.\n"
+            "2. REVIEW: When the Planner hands back a plan, present it clearly to the user in Markdown (table/list) and wait for confirmation.\n"
+            "3. START: Once the user explicitly confirms (e.g. 'go', 'execute'), hand off to the Executive agent to start autonomous processing.\n"
+            "4. REPORT: Receive final reports from the Executive and present them to the user."
+        )
         triage = await self.build_triage_agent(
-            all_specialists,
+            {}, 
             model=model,
             reasoning_effort=triage_reasoning_effort,
             triage_name=triage_name,
             triage_instructions=triage_instructions,
         )
 
-        # 5. Connect planning to triage and all specialist agents
-        # This allows the planning agent to consult specialists while making the plan.
-        handoffs_for_planning = [handoff(agent=triage)]
-        for name, ag in sub_agents.items():
-            handoffs_for_planning.append(handoff(agent=ag))
+        # 5. Connect Handoffs (New Autonomous Pipeline)
         
-        planning.handoffs = handoffs_for_planning
+        # 5a. Triage -> Planner OR Executive
+        triage.handoffs = [
+            handoff(
+                agent=planner,
+                input_type=TriageToPlanner,
+                on_handoff=lambda ctx, data: planner,
+                tool_description_override="Hand off complex requests to the Planner for deep skill analysis and workflow creation."
+            ),
+            handoff(
+                agent=executive,
+                input_type=Plan,
+                on_handoff=lambda ctx, data: executive,
+                tool_description_override="Launch autonomous execution of the confirmed plan using the Executive Agent."
+            )
+        ]
+        
+        # 5b. Planner -> Triage (Returns for confirmation)
+        planner.handoffs = [
+            handoff(
+                agent=triage,
+                input_type=Plan,
+                on_handoff=lambda ctx, data: triage,
+                tool_description_override="Return the completed plan to Triage for user review and approval."
+            )
+        ]
+        
+        # 5c. Executive -> Specialists OR Triage (Loops specialists, returns to Triage at end)
+        executive_handoffs = [
+            handoff(
+                agent=triage,
+                tool_description_override="Provide the final summary of the completed workflow back to Triage."
+            )
+        ]
+        for ag in sub_agents.values():
+            executive_handoffs.append(handoff(agent=ag))
+        executive.handoffs = executive_handoffs
 
-        # 6. Add return handoffs to all specialist sub-agents
-        # This allows specialists to explicitly return control to the orchestrators.
-        for name, ag in sub_agents.items():
-            if not ag.handoffs:
-                ag.handoffs = []
-            ag.handoffs.append(handoff(agent=triage))
-            ag.handoffs.append(handoff(agent=planning))
+        # 5d. Specialists -> Executive (The loop-back)
+        for ag in sub_agents.values():
+            ag.handoffs = [handoff(agent=executive)]
+
+        all_specialists = dict(sub_agents)
+        all_specialists[orchestrator_name] = planner
+        all_specialists[executive_name] = executive
 
         return triage, all_specialists
