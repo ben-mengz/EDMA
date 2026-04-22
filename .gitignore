@@ -6,3 +6,7 @@ __pycache__/
 *.pyc
 build/
 dist/
+
+# macOS metadata files
+.DS_Store
+._*

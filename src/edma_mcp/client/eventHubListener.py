@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -7,6 +8,9 @@ from typing import Any, Callable, Dict, List, Optional, Set
 
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 class EventDispatcher:

@@ -1,8 +1,9 @@
 import os
 import asyncio
+import json
 import tkinter as tk
 from tkinter import scrolledtext
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import threading
 
 # Import the new OpenAI Agents Python library
@@ -14,6 +15,8 @@ except ImportError:
 
 from edma_mcp.client.openai_bridge import OpenAIMCPBridge
 from edma_mcp.client.eventHubListener import EventHubListener, EventHubConfig, EventDispatcher
+from edma_mcp.client.models import PlanExecutionResult, PlanReview
+from edma_mcp.client.plan_executor import PlanExecutor
 from edma_mcp.client.thread_helper import ThreadHelper
 
 class EDMAChatApp:
@@ -69,6 +72,7 @@ class EDMAChatApp:
         
         self.log_system("System initialized. Waiting for UI Server to send events, or type a message below...", "system")
         self.history = []
+        self.pending_plan: Optional[PlanReview] = None
         if not HAS_AGENTS:
             self.log_system("Warning: 'openai-agents' Python package not found. Please 'pip install openai-agents' to use the SDK.", "error")
         else:
@@ -99,7 +103,14 @@ class EDMAChatApp:
         msg = self.user_input.get().strip()
         if not msg:
             return
-            
+
+        self.user_input.delete(0, tk.END)
+        self.log_system(msg, "user")
+
+        if self.pending_plan and self._is_approval_message(msg):
+            self.thread_helper.submit_async(self.execute_pending_plan())
+            return
+
         if not HAS_AGENTS:
             self.log_system("Cannot trigger LLM: 'agents' package missing.", "error")
             return
@@ -109,12 +120,73 @@ class EDMAChatApp:
             self.log_system("Cannot trigger LLM: API Key is empty!", "error")
             return
 
-        self.user_input.delete(0, tk.END)
-        self.log_system(msg, "user")
-        
         os.environ["OPENAI_API_KEY"] = api_key
         # Reuse the exact same async function we use for Remote triggers
         self.thread_helper.submit_async(self.run_agents_framework(msg))
+
+    def _is_approval_message(self, msg: str) -> bool:
+        return msg.strip().lower() in {"批准", "执行", "approve", "approved", "go", "yes", "run"}
+
+    def _extract_plan_review(self, output: Any) -> Optional[PlanReview]:
+        if isinstance(output, PlanReview):
+            return output
+        if hasattr(output, "model_dump"):
+            try:
+                return PlanReview.model_validate(output.model_dump())
+            except Exception:
+                pass
+        if isinstance(output, str):
+            text = output.strip()
+            candidates = [text]
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                candidates.append(text[start:end + 1])
+            for candidate in candidates:
+                try:
+                    return PlanReview.model_validate_json(candidate)
+                except Exception:
+                    try:
+                        return PlanReview.model_validate(json.loads(candidate))
+                    except Exception:
+                        continue
+        return None
+
+    def _render_plan_review(self, plan: PlanReview) -> str:
+        lines = [
+            f"Plan awaiting approval: {plan.goal}",
+            "",
+            plan.summary,
+            "",
+            "Steps:",
+        ]
+        for step in plan.steps:
+            lines.append(
+                f"{step.step_id}. {step.agent}.{step.tool_name} "
+                f"args={json.dumps(step.arguments, ensure_ascii=False)} -> {step.on_success}"
+            )
+            lines.append(f"   Goal: {step.goal}")
+            lines.append(f"   Expected: {step.expected_output}")
+            if step.required_inputs:
+                lines.append("   Ask at this step: " + "; ".join(step.required_inputs))
+            lines.append(f"   On failure: {step.on_failure}")
+        if plan.risks:
+            lines.extend(["", "Risks / assumptions:"])
+            lines.extend(f"- {item}" for item in plan.risks)
+        lines.extend(["", "Reply with 'approve' or 'go' to execute this plan. Step-specific missing inputs will be requested only when that step is reached."])
+        return "\n".join(lines)
+
+    def _render_execution_result(self, result: PlanExecutionResult) -> str:
+        lines = [
+            f"Execution status: {result.status}",
+            result.message,
+            "",
+            "Step results:",
+        ]
+        for item in result.results:
+            lines.append(f"- {item.step_id} {item.agent}.{item.tool_name}: {item.status}")
+            lines.append(f"  {item.result}")
+        return "\n".join(lines)
 
     def setup_dispatcher(self):
         @self.dispatcher.on("show")
@@ -152,30 +224,53 @@ class EDMAChatApp:
         def handle_default(event: Dict[str, Any]):
             self.log_system(f"Unhandled event: {event}", "system")
 
+    async def execute_pending_plan(self):
+        if not self.pending_plan:
+            self.log_system("No pending plan to execute.", "error")
+            return
+        plan = self.pending_plan
+        self.pending_plan = None
+        self.log_system("Executing approved plan via direct MCP tool calls...", "system")
+        try:
+            executor = PlanExecutor(self.bridge)
+            result = await executor.execute(plan)
+            self.log_system(self._render_execution_result(result), "llm")
+        except Exception as e:
+            self.log_system(f"Plan execution failed: {e}", "error")
+
     async def run_agents_framework(self, user_message: str):
         """
         Uses the `OpenAIMCPBridge` we made earlier, which directly translates all
         Server agents -> OpenAI Agent objects and connects them with handoffs.
         We then run it using `Runner`.
         """
-        self.log_system("Building Multi-Agent Network via FastMCP Bridge...", "system")
+        self.log_system("Building planning-enabled Multi-Agent Network via FastMCP Bridge...", "system")
         try:
+            if self.pending_plan:
+                user_message = (
+                    "Revise the pending plan using this user feedback.\n\n"
+                    f"Pending plan:\n{self.pending_plan.model_dump_json()}\n\n"
+                    f"User feedback:\n{user_message}"
+                )
+                self.pending_plan = None
+
             # 1. Ask bridge to assemble the Triage Agent & all Sub-Agents automatically
             # The Triage Agent is now the main entry point, and it includes the Planning Agent
             # as a specialist for complex task decomposition.
             triage_agent, sub_agents = await self.bridge.build_openai_system_via_fastmcp(
                 model="o3-mini",
                 triage_name="MainTriage",
-                orchestrator_name="Orchestrator",
-                triage_instructions="Direct simple requests to specialists. Forward complex requests to Orchestrator.",
-                orchestrator_model="o3-mini",
-                orchestrator_reasoning_effort="high",
+                planner_name="Orchestrator",
+                triage_instructions="For workflow requests, call create_workflow_plan and return its JSON exactly.",
+                planner_model="o3-mini",
+                planner_reasoning_effort="high",
                 playbooks_dir="src/edma_mcp/skills/playbooks",
+                enable_specialist_handoffs=False,
             )
             
             num_agents = len(sub_agents)
-            self.log_system(f"Assembled Triage agent routing across {num_agents} specialist(s) (including Orchestrator).", "system")
-            self.log_system(f"Starting execution via OpenAI `Runner.run()` starting with Triage Agent...", "system")
+            self.log_system(f"Assembled Triage agent routing across {num_agents} agent(s), with Planner exposed as a tool.", "system")
+            self.log_system("Generating or revising plan via OpenAI `Runner.run()`...", "system")
 
             # 2. Append new message to history
             self.history.append({"role": "user", "content": user_message})
@@ -189,9 +284,12 @@ class EDMAChatApp:
             # 4. Store the updated history (includes agent responses and tool results)
             self.history = result.to_input_list()
             
-            # 3. Output what happened
-            # Typically result.final_output contains the text response
-            self.log_system(f"{result.final_output}", "llm")
+            plan_review = self._extract_plan_review(result.final_output)
+            if plan_review:
+                self.pending_plan = plan_review
+                self.log_system(self._render_plan_review(plan_review), "llm")
+            else:
+                self.log_system(f"{result.final_output}", "llm")
             
             if hasattr(result, 'tool_calls') and result.tool_calls:
                 for t in result.tool_calls:

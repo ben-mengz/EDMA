@@ -5,11 +5,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from edma_mcp.client.bridge import MCPBridgeManager
 from fastmcp.client import Client as FastMCPClient
 from edma_mcp.client.orchestrator import OrchestratorUtils, get_orchestrator_instructions
-from edma_mcp.client.models import TriageToPlanner, ExecuteStepInput, ExecuteStepOutput
+from edma_mcp.client.models import PlanReview
 
 # Attempt to import OpenAI-specific agent framework libraries
 try:
     from agents import Agent, CodeInterpreterTool, ModelSettings
+    from agents.agent_output import AgentOutputSchema
     from agents.tool import FunctionTool
     from agents.handoffs import handoff
     HAS_AGENTS_FRAMEWORK = True
@@ -61,7 +62,11 @@ class OpenAIMCPBridge(MCPBridgeManager):
             ))
             
             instructions = await self._read_agent_prompt(agent_name)
-            instructions += "\nany mathematical problem you should solve with the code interpretor tool."
+            instructions += (
+                "\nany mathematical problem you should solve with the code interpretor tool."
+                "\nIf an MCP tool returns JSON with ok=false or an error field, treat the tool call as failed. "
+                "Report the failing tool name and exact error message back to the caller. Do not claim success."
+            )
             
             reasoning_str = await self._read_agent_reasoning_effort(agent_name)
             settings_kwargs = {}
@@ -154,13 +159,59 @@ class OpenAIMCPBridge(MCPBridgeManager):
             if args_json:
                 try:
                     args = json.loads(args_json)
-                except Exception:
-                    args = {}
+                except Exception as exc:
+                    return self._format_tool_error(
+                        agent_name=agent_name,
+                        tool_name=mcp_tool_name,
+                        error_type=type(exc).__name__,
+                        message=f"Invalid JSON arguments: {exc}",
+                        arguments_raw=args_json,
+                    )
 
-            bridge = await self._get_bridge(agent_name)
-            return await bridge.call_tool(mcp_tool_name, args)
+            try:
+                bridge = await self._get_bridge(agent_name)
+                return await bridge.call_tool(mcp_tool_name, args)
+            except Exception as exc:
+                return self._format_tool_error(
+                    agent_name=agent_name,
+                    tool_name=mcp_tool_name,
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                    arguments=args,
+                )
 
         return _invoke
+
+    def _format_tool_error(
+        self,
+        *,
+        agent_name: str,
+        tool_name: str,
+        error_type: str,
+        message: str,
+        arguments: Optional[Dict[str, Any]] = None,
+        arguments_raw: Optional[str] = None,
+    ) -> str:
+        return json.dumps(
+            {
+                "ok": False,
+                "error": {
+                    "agent": agent_name,
+                    "tool": tool_name,
+                    "type": error_type,
+                    "message": message,
+                    "arguments": arguments if arguments is not None else None,
+                    "arguments_raw": arguments_raw,
+                },
+                "instruction_to_llm": (
+                    "The MCP tool failed. Do not pretend it succeeded. "
+                    "Tell the user which tool failed and include the error message. "
+                    "If recoverable, ask for the specific missing input or propose the next recovery step."
+                ),
+            },
+            ensure_ascii=False,
+            default=str,
+        )
 
     def _make_list_resources_tool_for_agent(self, agent_name: str) -> "FunctionTool":
         """
@@ -341,36 +392,64 @@ class OpenAIMCPBridge(MCPBridgeManager):
             summary += "\n"
         return summary
 
-    async def build_planning_agent(
+    def _resolve_playbooks_dir(self, playbooks_dir: Optional[str] = None) -> str:
+        if playbooks_dir:
+            return os.path.abspath(playbooks_dir)
+        package_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(package_root, "skills", "playbooks")
+
+    async def build_planner_agent(
         self,
         sub_agents: Dict[str, "Agent"],
         *,
         model=None,
         reasoning_effort: Optional[str] = "high",
-        planning_instructions: Optional[str] = None,
-        planning_name: str = "planning_orchestrator",
+        planner_instructions: Optional[str] = None,
+        planner_name: str = "Planner",
+        playbooks_dir: Optional[str] = None,
     ) -> "Agent":
         """
-        Build a planning agent with knowledge of all specialist agents and their tools.
-        Note: The triage_agent handoff will be added after both agents are created to support circularity.
+        Build a planning agent that reads skills and returns a PlanReview.
+        This agent is used as a tool by Triage, not as a handoff target.
         """
-        registry_summary = await self._generate_agents_registry_summary(sub_agents)
-        
+        abs_playbooks_dir = self._resolve_playbooks_dir(playbooks_dir)
+        registry_summary = await self._generate_agents_registry_summary(sub_agents, detailed=True)
+        skill_instructions = get_orchestrator_instructions(abs_playbooks_dir, registry_summary)
+        self.planner_discovery_log = []
+
+        async def list_skills_tool(ctx, args_json: str) -> str:
+            self.planner_discovery_log = ["list_skills"]
+            return OrchestratorUtils.get_skills_catalog(abs_playbooks_dir)
+
+        async def read_skill_tool(ctx, args_json: str) -> str:
+            args = json.loads(args_json) if args_json else {}
+            skill_id = args.get("skill_id")
+            if not skill_id:
+                return "Error: skill_id is required."
+            self.planner_discovery_log.append(f"read_skill_content:{skill_id}")
+            return OrchestratorUtils.read_skill_content(abs_playbooks_dir, str(skill_id))
+
+        async def list_agents_capabilities_tool(ctx, args_json: str) -> str:
+            self.planner_discovery_log.append("list_agents_capabilities")
+            return registry_summary
+
         instructions = (
-            f"{planning_instructions or ''}\n"
-            "You are the Workflow Planning Agent. Your primary role is to coordinate complex tasks.\n"
-            "1. REQUISITE KNOWLEDGE:\n"
-            f"{registry_summary}\n"
-            "2. YOUR PROCESS:\n"
-            "   - When a user makes a request, analyze it and break it down into a sequence of high-level steps.\n"
-            "   - For each step, determine which specialist agent is best suited to execute it.\n"
-            "   - You are also allowed to consult or delegate planning sub-tasks DIRECTLY to specialist agents if needed.\n"
-            "   - IMPORTANT CONSULTATION RULE: When consulting a specialist, your query MUST clearly state: 'This request is ONLY for planning purposes. Do NOT execute any concrete actions yet. Once you provide the detailed workflow, you MUST use the handoff tool to return control to the Planning Agent.'\n"
-            "   - Once the high-level plan is ready, you MUST ACTUALLY CALL the handoff tool to transfer back to the Triage Agent.\n"
-            "   - DO NOT just state that you are handing off; you MUST invoke the tool.\n"
-            "   - Once the Triage Agent returns the detailed workflows for each step, aggregate them into a single final workflow for the user.\n"
-            "3. HANDOFF ENFORCEMENT:\n"
-            "   - To send the plan back, you MUST use the handoff tool for the Triage Agent.\n"
+            f"{planner_instructions or ''}\n\n"
+            f"{skill_instructions}\n\n"
+            "CRITICAL OUTPUT RULES:\n"
+            "- Return a PlanReview object only. Do not execute MCP tools.\n"
+            "- Every step must name an existing agent and exact MCP tool_name.\n"
+            "- Every step arguments field must be a JSON object, even when empty.\n"
+            "- Read the relevant skill before choosing tool names.\n"
+            "- Treat the selected skill as the workflow contract. Plan steps must come from the skill's ## Steps and ## Required Tools.\n"
+            "- If the selected skill references another skill/playbook, call read_skill_content for every referenced skill and expand those concrete steps into the plan.\n"
+            "- Do not invent bridge/check steps between compound-skill sections unless a referenced skill explicitly lists them.\n"
+            "- Do not add steps or tools merely because they appear in list_agents_capabilities. Agent capabilities are for validation only.\n"
+            "- If the user's request needs a step/tool that is not in the skill, put that limitation in risks instead of adding an unsourced step.\n"
+            "- Do not ask for all missing inputs during planning.\n"
+            "- Leave PlanReview.missing_inputs empty unless no executable draft plan can be made at all.\n"
+            "- Put step-specific missing inputs in that step's required_inputs list and set on_failure to ask_user when appropriate.\n"
+            "- If an argument will be known only after a previous step, use a clear placeholder such as {{step_3.data_path}} and explain it in required_inputs only if the user must provide it.\n"
         )
 
         settings_kwargs = {}
@@ -378,12 +457,58 @@ class OpenAIMCPBridge(MCPBridgeManager):
             settings_kwargs["reasoning"] = {"effort": reasoning_effort}
 
         return Agent(
-            name=planning_name,
+            name=planner_name,
             instructions=instructions,
-            handoffs=[], # Will be populated in build_openai_system_via_fastmcp
+            tools=[
+                FunctionTool(
+                    name="list_skills",
+                    description="List available workflow skills/playbooks.",
+                    params_json_schema={
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                    on_invoke_tool=list_skills_tool,
+                ),
+                FunctionTool(
+                    name="read_skill_content",
+                    description="Read a specific skill/playbook by skill_id.",
+                    params_json_schema={
+                        "type": "object",
+                        "properties": {
+                            "skill_id": {"type": "string", "description": "Skill ID to read."}
+                        },
+                        "required": ["skill_id"],
+                        "additionalProperties": False,
+                    },
+                    on_invoke_tool=read_skill_tool,
+                ),
+                FunctionTool(
+                    name="list_agents_capabilities",
+                    description="List discovered MCP agents and exact MCP tools.",
+                    params_json_schema={
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                    on_invoke_tool=list_agents_capabilities_tool,
+                ),
+            ],
+            handoffs=[],
             model=model,
-            model_settings=ModelSettings(**settings_kwargs) if settings_kwargs else ModelSettings()
+            model_settings=ModelSettings(**settings_kwargs) if settings_kwargs else ModelSettings(),
+            output_type=AgentOutputSchema(PlanReview, strict_json_schema=False),
         )
+
+    async def build_planning_agent(self, *args, **kwargs) -> "Agent":
+        """Backward-compatible alias for older callers."""
+        if "planning_name" in kwargs and "planner_name" not in kwargs:
+            kwargs["planner_name"] = kwargs.pop("planning_name")
+        if "planning_instructions" in kwargs and "planner_instructions" not in kwargs:
+            kwargs["planner_instructions"] = kwargs.pop("planning_instructions")
+        return await self.build_planner_agent(*args, **kwargs)
 
     async def build_triage_agent(
         self,
@@ -425,19 +550,10 @@ class OpenAIMCPBridge(MCPBridgeManager):
         instructions = (
             f"{triage_instructions or ''}\n"
             "You are a triage agent and coordination specialist.\n"
-            "1. ROUTING DECISION:\n"
-            "   - If a request is simple and requires only ONE specialist, hand off DIRECTLY to that agent.\n"
-            "   - If a request is complex and involves MULTIPLE agents or steps, hand off to the Planning Agent (Orchestrator).\n"
-            "2. HANDOFF ENFORCEMENT:\n"
-            "   - You MUST ACTUALLY CALL the handoff tool for the chosen agent. Never just describe the action in text.\n"
-            "3. WORKFLOW COORDINATION (From Planning Agent):\n"
-            "   - If you receive a multi-step plan from the Planning Agent, iterate through each step.\n"
-            "   - For each step, contact the relevant specialist agent and ask: 'Provide a detailed technical workflow for this step: [step description]'.\n"
-            "   - COLLECT AND SUMMARIZE these detailed responses.\n"
-            "   - Once all steps are detailed, you MUST ACTUALLY CALL the handoff tool to return the aggregate to the Planning Agent.\n"
-            "4. IMPORTANT:\n"
-            "   - Always hand off to specialists to get their specific workflow details.\n"
-            "   - Do not make up technical details for specialists yourself."
+            "1. For complex workflow planning, use the create_workflow_plan tool when it is available.\n"
+            "2. For explicit single-step execution/control requests, hand off to the matching specialist agent.\n"
+            "3. Never use handoff to carry a plan, user approval, or execution state.\n"
+            "4. If a planning tool returns JSON, return that JSON to the caller without rewriting it."
         )
 
         settings_kwargs = {}
@@ -462,20 +578,26 @@ class OpenAIMCPBridge(MCPBridgeManager):
         triage_name: str = "MainTriage",
         triage_instructions: Optional[str] = None,
         triage_reasoning_effort: Optional[str] = "high",
-        orchestrator_name: str = "Planner",
+        planner_name: str = "Planner",
+        planner_model: Optional[Any] = None,
+        planner_reasoning_effort: Optional[str] = "high",
+        planner_instructions: Optional[str] = None,
+        playbooks_dir: Optional[str] = None,
+        orchestrator_name: Optional[str] = None,
         orchestrator_model: Optional[Any] = None,
-        orchestrator_reasoning_effort: Optional[str] = "high",
-        executive_name: str = "Executive",
-        playbooks_dir: str = "src/edma_mcp/skills/playbooks",
+        orchestrator_reasoning_effort: Optional[str] = None,
+        enable_specialist_handoffs: bool = False,
     ) -> Tuple["Agent", Dict[str, "Agent"]]:
         """
-        Build a multi-agent system including:
-          - Triage (Entry point)
-          - Planner (Orchestrator, reads Playbooks, outputs ExecuteStepInput)
-          - Executive (Forwarder, connects Planner to Specialists)
-          - Specialists (MCP Agents)
+        Build a multi-agent system where Triage uses Planner as a tool for plans.
+        Handoffs are kept only for simple specialist routing.
         """
-        from edma_mcp.client.models import TriageToPlanner, ExecuteStepInput, ExecuteStepOutput, Plan
+        if orchestrator_name:
+            planner_name = orchestrator_name
+        if orchestrator_model:
+            planner_model = orchestrator_model
+        if orchestrator_reasoning_effort:
+            planner_reasoning_effort = orchestrator_reasoning_effort
 
         # 1. Build Specialist Agents from MCP
         sub_agents = await self.build_openai_sub_agents_from_fastmcp(
@@ -484,133 +606,84 @@ class OpenAIMCPBridge(MCPBridgeManager):
             tool_name_style=tool_name_style,
         )
 
-        # 2. Build Planner (Orchestrator)
-        import edma_mcp
-        package_root = os.path.dirname(os.path.dirname(edma_mcp.__file__))
-        abs_playbooks_dir = os.path.join(package_root, "edma_mcp", "skills", "playbooks")
-        
-        registry_summary = await self._generate_agents_registry_summary(sub_agents, detailed=False)
-        orchestrator_instructions = get_orchestrator_instructions(abs_playbooks_dir, registry_summary)
-        
-        settings_kwargs = {}
-        if orchestrator_reasoning_effort:
-            settings_kwargs["reasoning"] = {"effort": orchestrator_reasoning_effort}
-            
-        async def read_skill_tool(ctx, args_json: str) -> str:
-            args = json.loads(args_json) if args_json else {}
-            skill_id = args.get("skill_id")
-            return OrchestratorUtils.read_skill_content(abs_playbooks_dir, skill_id) if skill_id else "Error: skill_id is required."
-            
-        async def list_skills_tool(ctx, args_json: str) -> str:
-            return OrchestratorUtils.get_skills_catalog(abs_playbooks_dir)
-
-        planner = Agent(
-            name=orchestrator_name,
-            instructions=orchestrator_instructions,
-            model=orchestrator_model or model,
-            model_settings=ModelSettings(**settings_kwargs) if settings_kwargs else ModelSettings(),
-            tools=[
-                FunctionTool(
-                    name="list_skills",
-                    description="List all available high-level skills (Playbooks).",
-                    on_invoke_tool=list_skills_tool,
-                    params_json_schema={"type": "object", "properties": {}}
-                ),
-                FunctionTool(
-                    name="read_skill_content",
-                    description="Read the detailed step-by-step instructions for a specific skill.",
-                    on_invoke_tool=read_skill_tool,
-                    params_json_schema={
-                        "type": "object",
-                        "properties": {
-                            "skill_id": {"type": "string", "description": "The ID of the skill to read."}
-                        },
-                        "required": ["skill_id"]
-                    }
-                )
-            ],
-            handoffs=[]
+        # 2. Build Planner as a callable tool, not a handoff target.
+        planner = await self.build_planner_agent(
+            sub_agents,
+            model=planner_model or model,
+            reasoning_effort=planner_reasoning_effort,
+            planner_name=planner_name,
+            planner_instructions=planner_instructions,
+            playbooks_dir=playbooks_dir,
         )
 
-        # 3. Build Executive (Autonomous Loop Manager)
-        executive_instructions = (
-            "You are the Autonomous Executive (Workflow Manager).\n"
-            "1. ACCESS PLAN: You receive the full workflow plan within the shared context (WorkflowState).\n"
-            "2. LOOP EXECUTION: Based on the 'current_step_index' in the context, identify the next Specialist agent to call.\n"
-            "3. FORWARD: Use the corresponding handoff tool to the specialist. Provide precisely the 'input' and 'goal' specified in the plan.\n"
-            "4. ANALYZE & PROGRESS: When the specialist hands back to you, evaluate the 'on_success' or 'on_failure' instructions from the plan. Increment the step index or jump to fallback steps as needed.\n"
-            "5. COMPLETION: Once the plan reaches 'done' or 'stop', hand off back to the Triage Agent to present the final report.\n"
-            "RULE: You are the autonomous driver. Do NOT ask for user input. Your only handoff targets are Specialists and the Triage Agent."
-        )
-        executive = Agent(
-            name=executive_name,
-            instructions=executive_instructions,
-            model=model,
-            handoffs=[]
+        async def planner_output_extractor(run_result) -> str:
+            output = run_result.final_output
+            if isinstance(output, PlanReview):
+                return output.model_dump_json()
+            if hasattr(output, "model_dump_json"):
+                return output.model_dump_json()
+            return str(output)
+
+        planner_tool = planner.as_tool(
+            tool_name="create_workflow_plan",
+            tool_description=(
+                "Create a structured PlanReview for complex, multi-step, or workflow-style "
+                "requests. This only plans and never executes MCP tools. The input should include "
+                "the original user goal plus any constraints, current state, and success criteria."
+            ),
+            custom_output_extractor=planner_output_extractor,
         )
 
-        # 4. Build Triage (The Entry & Review Hub)
-        triage_instructions = (
+        # 3. Generate detailed summary for Triage.
+        registry_summary = await self._generate_agents_registry_summary(sub_agents, detailed=True)
+
+        # 4. Build Triage (The central hub).
+        combined_instructions = (
             f"{triage_instructions or ''}\n"
-            "You are the Main Triage and Approval Hub.\n"
-            "1. PLANNING: For complex tasks, hand off to the Planner to generate a 'Plan'.\n"
-            "2. REVIEW: When the Planner hands back a plan, present it clearly to the user in Markdown (table/list) and wait for confirmation.\n"
-            "3. START: Once the user explicitly confirms (e.g. 'go', 'execute'), hand off to the Executive agent to start autonomous processing.\n"
-            "4. REPORT: Receive final reports from the Executive and present them to the user."
+            "You are the Main Triage and Coordination Agent.\n"
+            "1. For complex, multi-step workflow requests, call create_workflow_plan and return its JSON result exactly.\n"
+            "1a. If the user provides a new requirement, asks for a recommendation/suggestion, asks to change parameters, or asks to plan/re-plan, call create_workflow_plan. Do not answer such requests directly from conversation history.\n"
+            "1b. If a pending plan is provided with a latest user message, call create_workflow_plan and let Planner decide whether to RESET to a fresh plan or REVISE the pending plan. Do not assume the new message continues the old plan.\n"
+            "2. For explicit immediate single-step execution/control requests, such as starting BF preview, getting SEM state, confirming ROI, or stopping preview, hand off to the matching specialist agent.\n"
+            "3. Do not call specialist handoff tools to create a PlanReview. After the user approves a PlanReview, execute it by reading each step and handing off to that step's specialist agent.\n"
+            "4. For approved PlanReview execution, follow the plan step order. Each handoff must include the step_id, exact tool_name, arguments, required_inputs, expected_output, on_success, and on_failure.\n"
+            "5. If a direct specialist/tool is available, never say you lack control access. Route to the specialist instead.\n"
+            "6. If create_workflow_plan fails for a planning request, report the failure and stop.\n\n"
+            f"{registry_summary}"
         )
         triage = await self.build_triage_agent(
-            {}, 
+            {}, # Specialists added via manual handoffs to control the registry
             model=model,
             reasoning_effort=triage_reasoning_effort,
             triage_name=triage_name,
-            triage_instructions=triage_instructions,
+            triage_instructions=combined_instructions,
         )
+        triage.tools = list(getattr(triage, "tools", [])) + [planner_tool]
 
-        # 5. Connect Handoffs (New Autonomous Pipeline)
-        
-        # 5a. Triage -> Planner OR Executive
-        triage.handoffs = [
-            handoff(
-                agent=planner,
-                input_type=TriageToPlanner,
-                on_handoff=lambda ctx, data: planner,
-                tool_description_override="Hand off complex requests to the Planner for deep skill analysis and workflow creation."
-            ),
-            handoff(
-                agent=executive,
-                input_type=Plan,
-                on_handoff=lambda ctx, data: executive,
-                tool_description_override="Launch autonomous execution of the confirmed plan using the Executive Agent."
-            )
-        ]
-        
-        # 5b. Planner -> Triage (Returns for confirmation)
-        planner.handoffs = [
-            handoff(
-                agent=triage,
-                input_type=Plan,
-                on_handoff=lambda ctx, data: triage,
-                tool_description_override="Return the completed plan to Triage for user review and approval."
-            )
-        ]
-        
-        # 5c. Executive -> Specialists OR Triage (Loops specialists, returns to Triage at end)
-        executive_handoffs = [
-            handoff(
-                agent=triage,
-                tool_description_override="Provide the final summary of the completed workflow back to Triage."
-            )
-        ]
-        for ag in sub_agents.values():
-            executive_handoffs.append(handoff(agent=ag))
-        executive.handoffs = executive_handoffs
+        # 5. Specialist handoffs are opt-in. Default workflow mode forbids fallback execution.
+        if enable_specialist_handoffs:
+            triage_handoffs = []
+            for ag in sub_agents.values():
+                triage_handoffs.append(handoff(
+                    agent=ag,
+                    tool_description_override=(
+                        f"Hand off to {ag.name} for direct specialist execution/control requests, "
+                        "single-step actions, or specialist questions. Do not use this handoff to pass a full PlanReview."
+                    )
+                ))
+            triage.handoffs = triage_handoffs
 
-        # 5d. Specialists -> Executive (The loop-back)
-        for ag in sub_agents.values():
-            ag.handoffs = [handoff(agent=executive)]
+            # Specialists -> Triage (Circular loop back)
+            for ag in sub_agents.values():
+                ag.handoffs = [handoff(
+                    agent=triage,
+                    tool_description_override="Return control to the Triage Agent after completing a task or if input is needed."
+                )]
+        else:
+            triage.handoffs = []
+            for ag in sub_agents.values():
+                ag.handoffs = []
 
-        all_specialists = dict(sub_agents)
-        all_specialists[orchestrator_name] = planner
-        all_specialists[executive_name] = executive
-
-        return triage, all_specialists
+        all_agents = dict(sub_agents)
+        all_agents[planner_name] = planner
+        return triage, all_agents

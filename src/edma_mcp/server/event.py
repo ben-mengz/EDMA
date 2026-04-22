@@ -120,8 +120,7 @@ class EventMCP(BaseMCP):
 
             # Optional: filter by scope (agent) if you want
             # If you do NOT want filtering, just ignore scope.
-            data = self._bus.read_after(after=after_i,scope=None)
-            print(data)
+            data = self._bus.read_after(after=after_i, scope=None)
 
             return json.dumps(data, ensure_ascii=False)
 
