@@ -257,13 +257,21 @@ class OpenAIMCPBridge(MCPBridgeManager):
             tool_name = f"{agent_name}__read_resource__{res_name}"
 
             async def _invoke(ctx, args_json: str, _uri=uri):
-                b = await self._get_bridge(agent_name)
-                res = await b.read_resource(_uri)
-                text = self._extract_resource_text(res)
-                if isinstance(text, str) and len(text) > max_chars:
-                    text = text[:max_chars] + "\n...[truncated]..."
+                try:
+                    b = await self._get_bridge(agent_name)
+                    res = await b.read_resource(_uri)
+                    text = self._extract_resource_text(res)
+                    if isinstance(text, str) and len(text) > max_chars:
+                        text = text[:max_chars] + "\n...[truncated]..."
 
-                return {"agent_name": agent_name, "uri": _uri, "text": text}
+                    return {"agent_name": agent_name, "uri": _uri, "text": text}
+                except Exception as exc:
+                    return self._format_tool_error(
+                        agent_name=agent_name,
+                        tool_name=tool_name,
+                        error_type=type(exc).__name__,
+                        message=f"Error reading resource '{_uri}': {exc}",
+                    )
                 
             tools.append(
                 FunctionTool(
@@ -295,6 +303,12 @@ class OpenAIMCPBridge(MCPBridgeManager):
     def _extract_resource_text(self, res: Any) -> str:
         if res is None:
             return ""
+        contents = getattr(res, "contents", None)
+        if isinstance(contents, list) and contents:
+            first = contents[0]
+            text = getattr(first, "text", None)
+            if isinstance(text, str):
+                return text
         if isinstance(res, list) and res:
             first = res[0]
             text = getattr(first, "text", None)
@@ -450,6 +464,11 @@ class OpenAIMCPBridge(MCPBridgeManager):
             "- Leave PlanReview.missing_inputs empty unless no executable draft plan can be made at all.\n"
             "- Put step-specific missing inputs in that step's required_inputs list and set on_failure to ask_user when appropriate.\n"
             "- If an argument will be known only after a previous step, use a clear placeholder such as {{step_3.data_path}} and explain it in required_inputs only if the user must provide it.\n"
+            "- Do not continue an old blocked execution step or old PlanReview from conversation history unless the latest user message explicitly says to continue/resume/execute it or directly provides that step's requested inputs.\n"
+            "- For a separate latest-message goal, create a fresh PlanReview starting at step_id 1.\n"
+            "- If the input includes UI action context/recent actions/tool trigger outputs, use them to infer completed skill steps and omit completed steps from the new PlanReview for that same workflow.\n"
+            "- Do not repeat completed tool calls shown in UI action context unless the user explicitly asks to redo them.\n"
+            "- Structured tool status is authoritative: success=completed, started=in_progress, blocked=ask_user, failed=address error before later steps.\n"
         )
 
         settings_kwargs = {}
@@ -644,6 +663,8 @@ class OpenAIMCPBridge(MCPBridgeManager):
             "1. For complex, multi-step workflow requests, call create_workflow_plan and return its JSON result exactly.\n"
             "1a. If the user provides a new requirement, asks for a recommendation/suggestion, asks to change parameters, or asks to plan/re-plan, call create_workflow_plan. Do not answer such requests directly from conversation history.\n"
             "1b. If a pending plan is provided with a latest user message, call create_workflow_plan and let Planner decide whether to RESET to a fresh plan or REVISE the pending plan. Do not assume the new message continues the old plan.\n"
+            "1c. If conversation history contains a blocked execution step or missing-input request, do not continue that step unless the latest user message explicitly answers it or says continue/resume/execute. A separate latest-message task must be planned fresh from step_id 1.\n"
+            "1d. If UI action context or trigger output shows that a workflow tool already completed, pass that context into create_workflow_plan and let Planner start from the next incomplete skill step.\n"
             "2. For explicit immediate single-step execution/control requests, such as starting BF preview, getting SEM state, confirming ROI, or stopping preview, hand off to the matching specialist agent.\n"
             "3. Do not call specialist handoff tools to create a PlanReview. After the user approves a PlanReview, execute it by reading each step and handing off to that step's specialist agent.\n"
             "4. For approved PlanReview execution, follow the plan step order. Each handoff must include the step_id, exact tool_name, arguments, required_inputs, expected_output, on_success, and on_failure.\n"

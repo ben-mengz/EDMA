@@ -2,7 +2,7 @@
 id: recommend_4d_stem_parameters
 name: Recommend 4D-STEM Experiment Parameters
 description: Workflow for checking current UI parameters, collecting required experiment constraints, calculating 4D-STEM/ptychography setup recommendations, validating constraints, and updating the Nion Swift recommendation UI.
-version: 1.0.0
+version: 1.1.0
 ---
 
 ## Agents Involved
@@ -15,8 +15,8 @@ Do not use this skill to acquire data. This skill only recommends and writes exp
 
 ## Required Tools
 - `agent_suggestion.agent_suggestion__read_resource__parameter_info` with arguments `{}` to inspect current essential and recommended parameter values from the UI.
+- `agent_suggestion.run_python_code` with arguments `{"code": <python_code_string>}` for free-form numeric calculations, optimization, sensitivity checks, and final constraint validation. The LLM decides the code based on the user's request, UI values, formulas, and constraints in this skill.
 - `agent_suggestion.update_parameters` with arguments `{"param_names": [...], "param_values": [...]}` to write recommended values back to the UI.
-- `code_interpreter` for all numeric calculations, optimization, constraint checking, and final validation.
 
 If the OpenAI wrapper exposes the resource tool under a different name, use the resource URI `nionswift://agent_suggestion/parameter_info` through the available resource-reading tool for `agent_suggestion`.
 
@@ -58,7 +58,7 @@ wavelength_A = 12.4 / ((2 * 511.0 + acc_voltage_keV) * acc_voltage_keV) ** 0.5
 ```
 
 ## Equations
-Use `code_interpreter` to calculate and optimize. Do not do this math only in natural language.
+Use `agent_suggestion.run_python_code` to calculate and optimize when numeric calculation is needed. Do not do numeric optimization only in natural language.
 
 ```python
 conv_semi_px = detector_max_px * ratio
@@ -123,24 +123,22 @@ Optimize in this priority order:
 
 ## Steps
 1. **Read current UI parameters**: Use the parameter-info resource/tool to inspect values already present in the UI.
-2. **Merge user and UI context**: Combine the user's request with UI values. Treat explicit user values as higher priority than UI defaults.
-3. **Check mandatory inputs**: Confirm `accelerating_voltage_keV`, `sample_thickness_nm`, and `dose_max_e_per_A2`. If any are missing, ask only for those values and stop.
-4. **Calculate recommendations**: Use `code_interpreter` to compute recommended values for any missing recommended parameters.
-5. **Validate constraints**: Use `code_interpreter` again to calculate all hard constraints and target metrics for the final recommendation.
-6. **Explain briefly**: Give a concise summary of recommended values and the limiting constraints.
-7. **Update UI**: Call `agent_suggestion.update_parameters` with matching `param_names` and `param_values` lists for the recommended values.
+2. **Calculate and validate recommendations**: Use `agent_suggestion.run_python_code` to merge user/UI context, check mandatory inputs, compute recommended values, optimize within constraints, and validate final metrics. The code should be chosen freely from the user request, UI state, formulas, constraints, and optimization targets in this skill. If mandatory inputs are missing, put only those missing values in this step's `required_inputs` and set `on_failure: ask_user`.
+3. **Update UI**: Call `agent_suggestion.update_parameters` with matching `param_names` and `param_values` lists for the recommended values returned by the calculation step.
 
 ## PlanReview Guidance
 When creating a plan for this skill:
 
 - Use `agent_suggestion` for UI/resource and update steps.
-- Include a code-interpreter calculation/validation step before `update_parameters`.
-- For calculation steps, copy the required constants, equations, constraints, and optimization targets from this skill into the step `arguments.calculation_spec`. Specialist agents do not read this skill directly, so the handoff must contain the calculation specification needed to execute the step.
-- Put missing mandatory inputs in `required_inputs` for the mandatory-input step.
+- Include an `agent_suggestion.run_python_code` calculation/validation step before `update_parameters` when numeric recommendation is needed.
+- For calculation steps, copy the relevant constants, equations, constraints, optimization targets, current UI values, and explicit user inputs from this skill/request into the handoff. The specialist agent can freely decide the exact calculation/optimization code.
+- Do not create abstract non-tool steps such as "merge context", "check inputs", or "explain". These must be folded into the `agent_suggestion.run_python_code` step's goal/expected_output or the final user-facing response.
+- Put missing mandatory inputs in `required_inputs` for the `agent_suggestion.run_python_code` step.
 - Put UI update failures under `on_failure: ask_user` or `on_failure: stop`, depending on whether the user can correct the issue.
 - Do not include acquisition tools in this skill. Acquisition belongs to the 4D-STEM acquisition skill.
 - Do not include ptychography reconstruction tools in this skill. Reconstruction belongs to the ptychography skill.
 - Do not create a plan that starts at a previous acquisition step number. Recommendation plans must start at step_id `1`.
+- If conversation history contains a blocked acquisition step, do not continue that step unless the latest user message explicitly asks to continue acquisition. Parameter suggestion requests should create this recommendation workflow from step_id `1`.
 
 ## Success Criteria
 - Current UI values were read.

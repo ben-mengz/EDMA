@@ -26,6 +26,7 @@ version: 1.3.0
 
 ## Planning Contract
 - The planner must not add steps outside the seven steps above.
+- For event-triggered continuation, if UI action context shows that one or more earlier steps already completed successfully, omit those completed steps and plan only the remaining suffix of the seven-step workflow. Keep the original logical step order, but the PlanReview may start at the next incomplete step.
 - The planner must use the exact tool names above. Do not use old names such as `sem_agent`, `turn_on_inlens_detector`, `confirm_roi_selection`, `apply_roi_parameters`, `calculate_scan_parameters`, or `acquire_4d_stem_data`.
 - Do not call `agent_sem.get_sem_state` in this workflow unless the user explicitly asks to inspect SEM state as a separate request.
 - Do not call `agent_sem.calculate_scan_parameters` in this workflow. The UI already performs scan-grid auto-calculation when scan points or scan step fields are updated.
@@ -35,6 +36,14 @@ version: 1.3.0
 - Optional numeric arguments must be JSON numbers when known and JSON `null` or omitted when unknown. Do not use the string `"None"`.
 - Do not add skip-acquisition, existing-data checks, SEM state checks, final validation, reconstruction, or parameter recommendation steps unless the user explicitly selects another skill that contains those steps.
 - `list_agents_capabilities` may be used only to verify that the required tools exist; it must not be used to add extra tools to this workflow.
+
+## Completed Action Mapping
+Use these UI/action events as evidence of completed workflow steps:
+
+- `agent_sem.trigger_llm play_bf`, `tool_name=play_bf`, or "BF Preview playback started" means step 1 is complete; the next planned step should be step 2 (`agent_sem.wait {"seconds": 10}`).
+- `agent_sem.trigger_llm sync_pixel_size`, `tool_name=sync_pixel_size`, or "Pixel size sync" means step 3 is complete; the next planned step should be step 4, asking the user to confirm ROI selection.
+- `agent_sem.trigger_llm stop_bf`, `tool_name=stop_bf`, `tool_name=stop_playing_detector`, or "BF Preview playback stopped" means step 5 is complete; the next planned step should be step 6 (`agent_sem.wait {"seconds": 10}`).
+- `agent_sem.trigger_llm acquire_4d_stem` with an acquisition-started or acquisition-finished message means step 7 has started or completed; do not plan a duplicate acquisition unless the user explicitly asks for another run.
 
 ## Success Criteria
 - BF preview starts.

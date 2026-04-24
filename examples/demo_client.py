@@ -1,6 +1,7 @@
 import os
 import asyncio
 import json
+import re
 import tkinter as tk
 from tkinter import scrolledtext
 from typing import Dict, Any, Optional
@@ -111,6 +112,18 @@ class EDMAChatApp:
             self.thread_helper.submit_async(self.execute_pending_plan())
             return
 
+        if self.pending_plan:
+            if self._should_arbitrate_pending_plan(msg):
+                msg = (
+                    "Revise the pending plan using this user feedback.\n\n"
+                    f"Pending plan:\n{self.pending_plan.model_dump_json()}\n\n"
+                    f"User feedback:\n{msg}"
+                )
+                self.pending_plan = None
+            else:
+                self.log_system("Plan is still waiting for approval. Reply with 'approve', 'go', or 'go ahead' to execute it, or tell me what to change.", "system")
+                return
+
         if not HAS_AGENTS:
             self.log_system("Cannot trigger LLM: 'agents' package missing.", "error")
             return
@@ -126,6 +139,70 @@ class EDMAChatApp:
 
     def _is_approval_message(self, msg: str) -> bool:
         return msg.strip().lower() in {"批准", "执行", "approve", "approved", "go", "yes", "run"}
+
+    def _is_approval_message(self, msg: str) -> bool:
+        normalized = self._normalize_plan_message(msg)
+        if not normalized:
+            return False
+        negative_phrases = {"dont", "do not", "not yet", "not now", "wait", "hold on", "hold off", "stop", "cancel"}
+        if any(phrase in normalized for phrase in negative_phrases):
+            return False
+        if normalized in {"æ‰¹å‡†", "æ‰§è¡Œ", "approve", "approved", "go", "yes", "run", "ok", "okay", "proceed", "execute"}:
+            return True
+        approval_patterns = (
+            r"\bgo ahead\b",
+            r"\bgo for it\b",
+            r"\bapprove(?:d)?(?: (?:it|this|that|the plan|the workflow))?\b",
+            r"\bproceed(?: with (?:it|this|that|the plan|the workflow))?\b",
+            r"\brun (?:it|this|that|the plan|the workflow)\b",
+            r"\bexecute(?: (?:it|this|that|the plan|the workflow))?\b",
+            r"\bstart(?: (?:it|this|that|the plan|the workflow))?\b",
+            r"\bcontinue(?: with (?:it|this|that|the plan|the workflow))?\b",
+            r"\bconfirm(?: and (?:run|execute|start))?\b",
+            r"\bdo it\b",
+            r"批准(?:执行)?",
+            r"执行",
+        )
+        return any(re.search(pattern, normalized) for pattern in approval_patterns)
+
+    def _should_arbitrate_pending_plan(self, msg: str) -> bool:
+        normalized = self._normalize_plan_message(msg)
+        if not normalized:
+            return False
+        revision_patterns = (
+            r"\bchange\b",
+            r"\bupdate\b",
+            r"\brevise\b",
+            r"\bmodify\b",
+            r"\badjust\b",
+            r"\breplan\b",
+            r"\bplan again\b",
+            r"\bnew plan\b",
+            r"\binstead\b",
+            r"\breplace\b",
+            r"\bswitch\b",
+            r"\bdifferent\b",
+            r"\banother\b",
+            r"\buse\b",
+            r"\bmake it\b",
+            r"\bcan you\b",
+            r"\bcould you\b",
+            r"\bi want\b",
+            r"\bi need\b",
+            r"\bwhat if\b",
+            r"\bwhy\b",
+            r"\bhow\b",
+            r"\?",
+            r"重新",
+            r"修改",
+            r"调整",
+            r"换成",
+        )
+        return any(re.search(pattern, normalized) for pattern in revision_patterns)
+
+    def _normalize_plan_message(self, msg: str) -> str:
+        normalized = " ".join(str(msg).strip().lower().split())
+        return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", " ", normalized).strip()
 
     def _extract_plan_review(self, output: Any) -> Optional[PlanReview]:
         if isinstance(output, PlanReview):
@@ -153,27 +230,24 @@ class EDMAChatApp:
         return None
 
     def _render_plan_review(self, plan: PlanReview) -> str:
+        user_plan = plan.to_user_plan()
         lines = [
-            f"Plan awaiting approval: {plan.goal}",
+            f"Plan awaiting approval: {user_plan['goal']}",
             "",
-            plan.summary,
+            user_plan["summary"],
             "",
             "Steps:",
         ]
-        for step in plan.steps:
-            lines.append(
-                f"{step.step_id}. {step.agent}.{step.tool_name} "
-                f"args={json.dumps(step.arguments, ensure_ascii=False)} -> {step.on_success}"
-            )
-            lines.append(f"   Goal: {step.goal}")
-            lines.append(f"   Expected: {step.expected_output}")
-            if step.required_inputs:
-                lines.append("   Ask at this step: " + "; ".join(step.required_inputs))
-            lines.append(f"   On failure: {step.on_failure}")
+        for step in user_plan["steps"]:
+            lines.append(f"{step['step_id']}. {step['action']}")
+            lines.append("   How it will be done: " + "; ".join(step["arguments"]))
+            if step["required_inputs"]:
+                lines.append("   Ask at this step: " + "; ".join(step["required_inputs"]))
+            lines.append(f"   Next: {step['next_step']}")
         if plan.risks:
             lines.extend(["", "Risks / assumptions:"])
             lines.extend(f"- {item}" for item in plan.risks)
-        lines.extend(["", "Reply with 'approve' or 'go' to execute this plan. Step-specific missing inputs will be requested only when that step is reached."])
+        lines.extend(["", "Reply with 'approve', 'go', or 'go ahead' to execute this plan. Step-specific missing inputs will be requested only when that step is reached."])
         return "\n".join(lines)
 
     def _render_execution_result(self, result: PlanExecutionResult) -> str:
