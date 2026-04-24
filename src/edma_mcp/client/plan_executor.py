@@ -105,10 +105,11 @@ class PlanExecutor:
             if step.agent not in tools_by_agent:
                 tools = await self.bridge.list_tools(step.agent)
                 tools_by_agent[step.agent] = {self._tool_name(tool) for tool in tools if self._tool_name(tool)}
-            if step.tool_name not in tools_by_agent[step.agent]:
+            normalized_tool_name = self._normalize_step_tool_name(step.agent, step.tool_name)
+            if normalized_tool_name not in tools_by_agent[step.agent]:
                 return (
                     f"Step '{step.step_id}' references unavailable tool "
-                    f"'{step.agent}.{step.tool_name}'."
+                    f"'{step.agent}.{normalized_tool_name}'."
                 )
         return ""
 
@@ -125,22 +126,24 @@ class PlanExecutor:
                 next_step="ask_user",
             )
         try:
-            raw_result = await self.bridge.call_tool(step.agent, step.tool_name, arguments)
+            normalized_tool_name = self._normalize_step_tool_name(step.agent, step.tool_name)
+            raw_result = await self.bridge.call_tool(step.agent, normalized_tool_name, arguments)
             result_text = self._stringify_tool_result(raw_result)
             return StepExecutionResult(
                 step_id=step.step_id,
                 agent=step.agent,
-                tool_name=step.tool_name,
+                tool_name=normalized_tool_name,
                 status="success",
                 result=result_text,
                 raw_result=raw_result,
                 next_step=step.on_success,
             )
         except Exception as exc:
+            normalized_tool_name = self._normalize_step_tool_name(step.agent, step.tool_name)
             return StepExecutionResult(
                 step_id=step.step_id,
                 agent=step.agent,
-                tool_name=step.tool_name,
+                tool_name=normalized_tool_name,
                 status="failed",
                 result=str(exc),
                 next_step=step.on_failure,
@@ -213,9 +216,16 @@ class PlanExecutor:
     def _record_step_context(self, context: Dict[str, Any], step: PlanStep, raw_result: Any) -> None:
         value = self._normalize_context_value(raw_result)
         context[step.step_id] = value
-        context[step.tool_name] = value
+        context[self._normalize_step_tool_name(step.agent, step.tool_name)] = value
         if step.tool_name == "calculate_scan_parameters":
             context["calc"] = value
+
+    def _normalize_step_tool_name(self, agent_name: str, tool_name: str) -> str:
+        raw = str(tool_name or "").strip()
+        prefix = f"{agent_name}."
+        if raw.startswith(prefix):
+            return raw[len(prefix):]
+        return raw
 
     def _normalize_context_value(self, value: Any) -> Any:
         if isinstance(value, list) and len(value) == 1:

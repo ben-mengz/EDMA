@@ -24,6 +24,21 @@ class OpenAIMCPBridge(MCPBridgeManager):
     MCP agents, tools, and resources into an OpenAI Multi-Agent system.
     """
 
+    def _build_reasoning_settings(
+        self,
+        reasoning_effort: Optional[str] = None,
+        reasoning_summary: Optional[str] = "auto",
+    ) -> Dict[str, Any]:
+        settings_kwargs: Dict[str, Any] = {}
+        reasoning: Dict[str, Any] = {}
+        if reasoning_effort:
+            reasoning["effort"] = reasoning_effort
+        if reasoning_summary:
+            reasoning["summary"] = reasoning_summary
+        if reasoning:
+            settings_kwargs["reasoning"] = reasoning
+        return settings_kwargs
+
     async def build_openai_sub_agents_from_fastmcp(
         self,
         *,
@@ -471,9 +486,7 @@ class OpenAIMCPBridge(MCPBridgeManager):
             "- Structured tool status is authoritative: success=completed, started=in_progress, blocked=ask_user, failed=address error before later steps.\n"
         )
 
-        settings_kwargs = {}
-        if reasoning_effort:
-            settings_kwargs["reasoning"] = {"effort": reasoning_effort}
+        settings_kwargs = self._build_reasoning_settings(reasoning_effort=reasoning_effort, reasoning_summary="auto")
 
         return Agent(
             name=planner_name,
@@ -575,9 +588,7 @@ class OpenAIMCPBridge(MCPBridgeManager):
             "4. If a planning tool returns JSON, return that JSON to the caller without rewriting it."
         )
 
-        settings_kwargs = {}
-        if reasoning_effort:
-            settings_kwargs["reasoning"] = {"effort": reasoning_effort}
+        settings_kwargs = self._build_reasoning_settings(reasoning_effort=reasoning_effort, reasoning_summary="auto")
 
         return Agent(
             name=triage_name,
@@ -606,6 +617,7 @@ class OpenAIMCPBridge(MCPBridgeManager):
         orchestrator_model: Optional[Any] = None,
         orchestrator_reasoning_effort: Optional[str] = None,
         enable_specialist_handoffs: bool = False,
+        include_planner_tool_on_triage: bool = True,
     ) -> Tuple["Agent", Dict[str, "Agent"]]:
         """
         Build a multi-agent system where Triage uses Planner as a tool for plans.
@@ -657,19 +669,27 @@ class OpenAIMCPBridge(MCPBridgeManager):
         registry_summary = await self._generate_agents_registry_summary(sub_agents, detailed=True)
 
         # 4. Build Triage (The central hub).
-        combined_instructions = (
-            f"{triage_instructions or ''}\n"
-            "You are the Main Triage and Coordination Agent.\n"
+        planning_rule = (
             "1. For complex, multi-step workflow requests, call create_workflow_plan and return its JSON result exactly.\n"
             "1a. If the user provides a new requirement, asks for a recommendation/suggestion, asks to change parameters, or asks to plan/re-plan, call create_workflow_plan. Do not answer such requests directly from conversation history.\n"
             "1b. If a pending plan is provided with a latest user message, call create_workflow_plan and let Planner decide whether to RESET to a fresh plan or REVISE the pending plan. Do not assume the new message continues the old plan.\n"
             "1c. If conversation history contains a blocked execution step or missing-input request, do not continue that step unless the latest user message explicitly answers it or says continue/resume/execute. A separate latest-message task must be planned fresh from step_id 1.\n"
             "1d. If UI action context or trigger output shows that a workflow tool already completed, pass that context into create_workflow_plan and let Planner start from the next incomplete skill step.\n"
+        ) if include_planner_tool_on_triage else (
+            "1. Planning is handled by the caller's direct Planner path. Do not create or revise plans here.\n"
+            "1a. If the user asks for planning, recommendation, re-planning, or parameter-selection workflow design, tell the caller to use the dedicated Planner path instead of handling it in Triage.\n"
+            "1b. Only handle direct immediate specialist execution/control requests here.\n"
+        )
+
+        combined_instructions = (
+            f"{triage_instructions or ''}\n"
+            "You are the Main Triage and Coordination Agent.\n"
+            f"{planning_rule}"
             "2. For explicit immediate single-step execution/control requests, such as starting BF preview, getting SEM state, confirming ROI, or stopping preview, hand off to the matching specialist agent.\n"
             "3. Do not call specialist handoff tools to create a PlanReview. After the user approves a PlanReview, execute it by reading each step and handing off to that step's specialist agent.\n"
             "4. For approved PlanReview execution, follow the plan step order. Each handoff must include the step_id, exact tool_name, arguments, required_inputs, expected_output, on_success, and on_failure.\n"
             "5. If a direct specialist/tool is available, never say you lack control access. Route to the specialist instead.\n"
-            "6. If create_workflow_plan fails for a planning request, report the failure and stop.\n\n"
+            "6. If the relevant planning or execution route fails, report the failure and stop.\n\n"
             f"{registry_summary}"
         )
         triage = await self.build_triage_agent(
@@ -679,7 +699,8 @@ class OpenAIMCPBridge(MCPBridgeManager):
             triage_name=triage_name,
             triage_instructions=combined_instructions,
         )
-        triage.tools = list(getattr(triage, "tools", [])) + [planner_tool]
+        if include_planner_tool_on_triage:
+            triage.tools = list(getattr(triage, "tools", [])) + [planner_tool]
 
         # 5. Specialist handoffs are opt-in. Default workflow mode forbids fallback execution.
         if enable_specialist_handoffs:

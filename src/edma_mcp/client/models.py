@@ -153,6 +153,8 @@ class PlanReview(BaseModel):
     user_steps: List[UserPlanStep] = Field(default_factory=list, description="LLM-authored plain-language plan steps shown to the user.")
     missing_inputs: List[str] = Field(default_factory=list, description="Deprecated top-level field. Prefer PlanStep.required_inputs so execution asks only when that step is reached.")
     risks: List[str] = Field(default_factory=list, description="Known risks or assumptions to review.")
+    judge_report: Optional["PlanJudgeReport"] = Field(default=None, description="Deterministic plan grounding and schema validation result.")
+    judge_replan_history: List[str] = Field(default_factory=list, description="Brief history of automatic judge-triggered replanning attempts.")
 
     @model_validator(mode="after")
     def validate_plan_references(self) -> "PlanReview":
@@ -228,3 +230,21 @@ class PlanExecutionResult(BaseModel):
     completed_steps: List[str] = Field(default_factory=list)
     results: List[StepExecutionResult] = Field(default_factory=list)
     message: str = ""
+
+
+class PlanJudgeIssue(BaseModel):
+    severity: Literal["info", "warning", "blocking"] = "blocking"
+    category: Literal["grounding", "skill", "order", "agent", "tool", "parameter"] = "grounding"
+    step_id: Optional[str] = None
+    skill: Optional[str] = None
+    message: str
+
+
+class PlanJudgeReport(BaseModel):
+    grounding_status: Literal["fully_grounded", "partially_grounded", "ungrounded"] = "ungrounded"
+    status: Literal["pass", "revise", "block"] = "block"
+    summary: str = ""
+    issues: List[PlanJudgeIssue] = Field(default_factory=list)
+
+
+PlanReview.model_rebuild()
