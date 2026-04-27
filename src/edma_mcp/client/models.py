@@ -43,6 +43,15 @@ def _format_user_value(value: Any) -> str:
         return preview
     return str(value)
 
+
+def _normalize_terminal_ref(value: str) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in {"ask_user", "askuser"}:
+        return "ask_user"
+    if normalized in {"done", "stop"}:
+        return normalized
+    return str(value or "").strip()
+
 class WorkflowState(BaseModel):
     """Global workflow state maintained in context."""
     user_goal: str = ""
@@ -80,6 +89,8 @@ class PlanStep(BaseModel):
         value = value.strip()
         if not value:
             raise ValueError("must not be empty")
+        if value in {"done", "stop"} or value.lower().replace("-", "_").replace(" ", "_") in {"ask_user", "askuser"}:
+            return _normalize_terminal_ref(value)
         return value
 
     def user_action_text(self) -> str:

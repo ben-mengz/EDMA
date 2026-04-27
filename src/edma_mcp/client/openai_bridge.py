@@ -423,7 +423,12 @@ class OpenAIMCPBridge(MCPBridgeManager):
 
     def _resolve_playbooks_dir(self, playbooks_dir: Optional[str] = None) -> str:
         if playbooks_dir:
-            return os.path.abspath(playbooks_dir)
+            resolved = os.path.abspath(playbooks_dir)
+            self._configured_playbooks_dir = resolved
+            return resolved
+        configured = getattr(self, "_configured_playbooks_dir", None)
+        if configured:
+            return configured
         package_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         return os.path.join(package_root, "skills", "playbooks")
 
@@ -458,6 +463,37 @@ class OpenAIMCPBridge(MCPBridgeManager):
             self.planner_discovery_log.append(f"read_skill_content:{skill_id}")
             return OrchestratorUtils.read_skill_content(abs_playbooks_dir, str(skill_id))
 
+        async def get_skill_manifest_tool(ctx, args_json: str) -> str:
+            args = json.loads(args_json) if args_json else {}
+            skill_id = args.get("skill_id")
+            if not skill_id:
+                return "Error: skill_id is required."
+            self.planner_discovery_log.append(f"get_skill_manifest:{skill_id}")
+            return json.dumps(
+                OrchestratorUtils.get_skill_manifest(abs_playbooks_dir, str(skill_id)),
+                ensure_ascii=False,
+            )
+
+        async def list_skill_resources_tool(ctx, args_json: str) -> str:
+            args = json.loads(args_json) if args_json else {}
+            skill_id = args.get("skill_id")
+            if not skill_id:
+                return "Error: skill_id is required."
+            self.planner_discovery_log.append(f"list_skill_resources:{skill_id}")
+            return json.dumps(
+                OrchestratorUtils.list_skill_resources(abs_playbooks_dir, str(skill_id)),
+                ensure_ascii=False,
+            )
+
+        async def read_skill_resource_tool(ctx, args_json: str) -> str:
+            args = json.loads(args_json) if args_json else {}
+            skill_id = args.get("skill_id")
+            resource_path = args.get("resource_path")
+            if not skill_id or not resource_path:
+                return "Error: skill_id and resource_path are required."
+            self.planner_discovery_log.append(f"read_skill_resource:{skill_id}:{resource_path}")
+            return OrchestratorUtils.read_skill_resource(abs_playbooks_dir, str(skill_id), str(resource_path))
+
         async def list_agents_capabilities_tool(ctx, args_json: str) -> str:
             self.planner_discovery_log.append("list_agents_capabilities")
             return registry_summary
@@ -469,10 +505,11 @@ class OpenAIMCPBridge(MCPBridgeManager):
             "- Return a PlanReview object only. Do not execute MCP tools.\n"
             "- Every step must name an existing agent and exact MCP tool_name.\n"
             "- Every step arguments field must be a JSON object, even when empty.\n"
-            "- Read the relevant skill before choosing tool names.\n"
+            "- Read the relevant skill manifest and skill content before choosing tool names.\n"
             "- Treat the selected skill as the workflow contract. Plan steps must come from the skill's ## Steps and ## Required Tools.\n"
             "- If the selected skill references another skill/playbook, call read_skill_content for every referenced skill and expand those concrete steps into the plan.\n"
             "- Do not invent bridge/check steps between compound-skill sections unless a referenced skill explicitly lists them.\n"
+            "- Use list_skill_resources and read_skill_resource only when the skill package includes templates, snippets, examples, or assets that are needed for planning.\n"
             "- Do not add steps or tools merely because they appear in list_agents_capabilities. Agent capabilities are for validation only.\n"
             "- If the user's request needs a step/tool that is not in the skill, put that limitation in risks instead of adding an unsourced step.\n"
             "- Do not ask for all missing inputs during planning.\n"
@@ -515,6 +552,46 @@ class OpenAIMCPBridge(MCPBridgeManager):
                         "additionalProperties": False,
                     },
                     on_invoke_tool=read_skill_tool,
+                ),
+                FunctionTool(
+                    name="get_skill_manifest",
+                    description="Read the structured manifest for a specific skill package by skill_id.",
+                    params_json_schema={
+                        "type": "object",
+                        "properties": {
+                            "skill_id": {"type": "string", "description": "Skill ID to inspect."}
+                        },
+                        "required": ["skill_id"],
+                        "additionalProperties": False,
+                    },
+                    on_invoke_tool=get_skill_manifest_tool,
+                ),
+                FunctionTool(
+                    name="list_skill_resources",
+                    description="List templates, snippets, examples, assets, and core files bundled with a skill package.",
+                    params_json_schema={
+                        "type": "object",
+                        "properties": {
+                            "skill_id": {"type": "string", "description": "Skill ID to inspect."}
+                        },
+                        "required": ["skill_id"],
+                        "additionalProperties": False,
+                    },
+                    on_invoke_tool=list_skill_resources_tool,
+                ),
+                FunctionTool(
+                    name="read_skill_resource",
+                    description="Read a specific resource from a skill package, such as a template or example.",
+                    params_json_schema={
+                        "type": "object",
+                        "properties": {
+                            "skill_id": {"type": "string", "description": "Skill ID to inspect."},
+                            "resource_path": {"type": "string", "description": "Relative path inside the skill package."}
+                        },
+                        "required": ["skill_id", "resource_path"],
+                        "additionalProperties": False,
+                    },
+                    on_invoke_tool=read_skill_resource_tool,
                 ),
                 FunctionTool(
                     name="list_agents_capabilities",

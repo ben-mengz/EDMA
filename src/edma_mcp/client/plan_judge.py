@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import os
-import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from edma_mcp.client.models import PlanJudgeIssue, PlanJudgeReport, PlanReview
+from edma_mcp.skills.provider import FilesystemSkillProvider
 
 
 @dataclass
@@ -15,40 +15,30 @@ class SkillContract:
     ordered_tools: List[str]
 
 
-def _extract_section(text: str, title: str) -> str:
-    pattern = rf"^## {re.escape(title)}\s*$([\s\S]*?)(?=^## |\Z)"
-    match = re.search(pattern, text, flags=re.MULTILINE)
-    return match.group(1).strip() if match else ""
-
-
-def _parse_skill_contract(skill_path: str) -> SkillContract:
-    with open(skill_path, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    skill_id = os.path.basename(os.path.dirname(skill_path))
-    required_tools_text = _extract_section(content, "Required Tools")
-    steps_text = _extract_section(content, "Steps")
-
-    required_tools = re.findall(r"`([A-Za-z0-9_]+\.[A-Za-z0-9_]+)`", required_tools_text)
-    ordered_tools = re.findall(r"`([A-Za-z0-9_]+\.[A-Za-z0-9_]+)`", steps_text)
-
-    return SkillContract(
-        skill_id=skill_id,
-        required_tools=required_tools,
-        ordered_tools=ordered_tools,
-    )
-
-
 def _load_skill_contracts(playbooks_dir: str) -> Dict[str, SkillContract]:
     contracts: Dict[str, SkillContract] = {}
+    provider = FilesystemSkillProvider(playbooks_dir)
     if not os.path.isdir(playbooks_dir):
         return contracts
-    for root, _, files in os.walk(playbooks_dir):
-        if "SKILL.md" not in files:
+    for meta in provider.list_skills():
+        skill_id = str(meta.get("id", "")).strip()
+        if not skill_id:
             continue
-        path = os.path.join(root, "SKILL.md")
-        contract = _parse_skill_contract(path)
-        contracts[contract.skill_id] = contract
+        try:
+            manifest = provider.get_skill_manifest(skill_id)
+        except Exception:
+            continue
+        required_tools = manifest.get("required_tools") or []
+        ordered_tools = manifest.get("ordered_tools") or []
+        if not isinstance(required_tools, list):
+            required_tools = []
+        if not isinstance(ordered_tools, list):
+            ordered_tools = []
+        contracts[skill_id] = SkillContract(
+            skill_id=skill_id,
+            required_tools=[str(tool) for tool in required_tools],
+            ordered_tools=[str(tool) for tool in ordered_tools],
+        )
     return contracts
 
 

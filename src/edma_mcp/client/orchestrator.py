@@ -1,59 +1,39 @@
-import os
-import json
 from typing import List, Dict, Any
+
+from edma_mcp.skills.provider import FilesystemSkillProvider
 
 class OrchestratorUtils:
     """Utility class for the Orchestrator (Planning Agent) to manage skills and plans."""
     
     @staticmethod
     def list_skills(playbooks_dir: str) -> List[Dict[str, str]]:
-        """Scan subdirectories for SKILL.md files and extract basic metadata."""
-        skills = []
-        if not os.path.exists(playbooks_dir):
-            return []
-        
-        for root, dirs, files in os.walk(playbooks_dir):
-            if "SKILL.md" in files:
-                path = os.path.join(root, "SKILL.md")
-                skill_id = os.path.basename(root)
-                
-                with open(path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                    
-                meta = {"id": skill_id, "name": skill_id, "description": "No description provided."}
-                if content.startswith("---"):
-                    parts = content.split("---", 2)
-                    if len(parts) >= 3:
-                        frontmatter = parts[1]
-                        import yaml
-                        try:
-                            data = yaml.safe_load(frontmatter)
-                            if isinstance(data, dict):
-                                meta.update(data)
-                        except Exception:
-                            pass
-                skills.append(meta)
-        return skills
+        """List skill metadata through the default filesystem skill provider."""
+        return FilesystemSkillProvider(playbooks_dir).list_skills()
+
+    @staticmethod
+    def get_skill_manifest(playbooks_dir: str, skill_id: str) -> Dict[str, Any]:
+        """Return the structured manifest for one skill."""
+        return FilesystemSkillProvider(playbooks_dir).get_skill_manifest(skill_id)
 
     @staticmethod
     def read_skill_content(playbooks_dir: str, skill_id: str) -> str:
         """Read the full content of a specific SKILL.md."""
-        path = os.path.join(playbooks_dir, skill_id, "SKILL.md")
-        if not os.path.exists(path):
-            return f"Error: Skill {skill_id} not found."
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
+        return FilesystemSkillProvider(playbooks_dir).read_skill_content(skill_id)
+
+    @staticmethod
+    def list_skill_resources(playbooks_dir: str, skill_id: str) -> List[Dict[str, str]]:
+        """List all resources exposed by one skill package."""
+        return FilesystemSkillProvider(playbooks_dir).list_skill_resources(skill_id)
+
+    @staticmethod
+    def read_skill_resource(playbooks_dir: str, skill_id: str, resource_path: str) -> str:
+        """Read a skill package resource such as a template or snippet."""
+        return FilesystemSkillProvider(playbooks_dir).read_skill_resource(skill_id, resource_path)
 
     @staticmethod
     def get_skills_catalog(playbooks_dir: str) -> str:
         """Generate a catalog summary of all available skills."""
-        skills = OrchestratorUtils.list_skills(playbooks_dir)
-        catalog = "AVAILABLE SKILLS CATALOG:\n\n"
-        for s in skills:
-            catalog += f"- **ID**: {s.get('id')}\n"
-            catalog += f"  **Name**: {s.get('name')}\n"
-            catalog += f"  **Description**: {s.get('description')}\n\n"
-        return catalog
+        return FilesystemSkillProvider(playbooks_dir).build_skills_catalog()
 
 def get_orchestrator_instructions(playbooks_dir: str, registry_summary: str = "") -> str:
     """Generate the system instructions for the Planner (Architect) Agent."""
@@ -62,7 +42,7 @@ def get_orchestrator_instructions(playbooks_dir: str, registry_summary: str = ""
     instructions = f"""You are the Automated Workflow Architect (Planner). Your sole goal is to discover the right technical skills and design a skill-bound execution blueprint.
 
 ### ⚠️ OPERATIONAL PROTOCOL
-1. **DISCOVERY FIRST**: You MUST call `list_skills` and `read_skill_content` to understand technical function names. Technical functions are hidden from your default context.
+1. **DISCOVERY FIRST**: You MUST call `list_skills`, `get_skill_manifest`, and `read_skill_content` to understand skill contracts and technical function names. Technical functions are hidden from your default context.
 2. **SKILL IS THE CONTRACT**: After selecting a skill, the plan steps MUST follow that skill's `## Steps` and `## Required Tools`. Do not add steps, tools, validations, waits, checkpoints, or safety checks that are not explicitly present in the selected skill.
 3. **CAPABILITIES ARE VALIDATION ONLY**: Use `list_agents_capabilities` only to confirm that a skill-listed `agent.tool_name` exists. Do not use agent capabilities to invent extra workflow steps.
 4. **EXPAND REFERENCED SKILLS**: If a selected skill references another skill/playbook by id or name, you MUST call `read_skill_content` for every referenced skill and expand those referenced skill steps into concrete PlanSteps. Do not invent bridge/check steps between referenced skills.
@@ -81,7 +61,10 @@ def get_orchestrator_instructions(playbooks_dir: str, registry_summary: str = ""
 
 ### 2. DISCOVERY TOOLS
 - `list_skills`: Browse high-level Playbooks.
+- `get_skill_manifest`: Read the structured contract for a skill package.
 - `read_skill_content`: Read technical documentation (MANDATORY before planning).
+- `list_skill_resources`: Inspect templates, snippets, examples, and assets bundled with a skill.
+- `read_skill_resource`: Read a specific template, snippet, example, or asset text resource from a skill package.
 - `list_agents_capabilities`: Inspect discovered MCP agents and exact available tools.
 
 ### 3. PLANREVIEW REQUIREMENTS
