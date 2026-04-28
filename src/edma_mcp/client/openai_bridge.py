@@ -45,6 +45,7 @@ class OpenAIMCPBridge(MCPBridgeManager):
         exclude_agents: Optional[List[str]] = None,
         include_resource_list_tool: bool = True,
         tool_name_style: str = "plain",
+        playbooks_dir: Optional[str] = None,
     ) -> Dict[str, "Agent"]:
         """
         Build one OpenAI Agent per MCP agent, using FastMCP bridge as transport.
@@ -58,6 +59,8 @@ class OpenAIMCPBridge(MCPBridgeManager):
         excluded = set(exclude_agents or [])
         sub_agents: Dict[str, Agent] = {}
 
+        abs_playbooks_dir = self._resolve_playbooks_dir(playbooks_dir)
+
         for agent_name in self._agent_names:
             if agent_name in excluded:
                 continue
@@ -67,21 +70,36 @@ class OpenAIMCPBridge(MCPBridgeManager):
                 include_resource_list_tool=include_resource_list_tool,
                 tool_name_style=tool_name_style,
             )
+            tools.extend(self._build_skill_resource_tools(abs_playbooks_dir))
             
-            # Optionally add code interpreter
-            tools.append(CodeInterpreterTool(
-                tool_config={
-                    "type": "code_interpreter",
-                    "container": {"type": "auto"},
-                }
-            ))
+            # Optionally add code interpreter. Keep agent_suggestion on its MCP-backed
+            # run_python_code path so code review/confirmation popup is preserved.
+            if agent_name != "agent_suggestion":
+                tools.append(CodeInterpreterTool(
+                    tool_config={
+                        "type": "code_interpreter",
+                        "container": {"type": "auto"},
+                    }
+                ))
             
             instructions = await self._read_agent_prompt(agent_name)
             instructions += (
-                "\nany mathematical problem you should solve with the code interpretor tool."
                 "\nIf an MCP tool returns JSON with ok=false or an error field, treat the tool call as failed. "
                 "Report the failing tool name and exact error message back to the caller. Do not claim success."
+                "\nIf a handoff or approved-plan step includes a skill and non-empty resource_hints, treat those "
+                "resource paths as required execution context for that step."
+                "\nFor any code-writing, code-generation, or code-running step with resource_hints, first read the "
+                "listed skill resources before producing or executing code."
+                "\nDo not ignore resource_hints by relying only on prior memory or generic reasoning."
             )
+            if agent_name == "agent_suggestion":
+                instructions += (
+                    "\nFor all numeric calculation, optimization, sensitivity checks, and constraint validation, "
+                    "use the MCP tool run_python_code rather than any built-in code interpreter. "
+                    "That tool is the reviewed execution path and may open a user confirmation dialog."
+                )
+            else:
+                instructions += "\nAny mathematical problem you should solve with the code interpretor tool."
             
             reasoning_str = await self._read_agent_reasoning_effort(agent_name)
             settings_kwargs = {}
@@ -99,6 +117,98 @@ class OpenAIMCPBridge(MCPBridgeManager):
             sub_agents[agent_name] = Agent(**kwargs)
 
         return sub_agents
+
+    def _build_skill_resource_tools(self, playbooks_dir: str) -> List["FunctionTool"]:
+        async def get_skill_manifest_tool(ctx, args_json: str) -> str:
+            args = json.loads(args_json) if args_json else {}
+            skill_id = args.get("skill_id")
+            if not skill_id:
+                return "Error: skill_id is required."
+            return json.dumps(
+                OrchestratorUtils.get_skill_manifest(playbooks_dir, str(skill_id)),
+                ensure_ascii=False,
+            )
+
+        async def read_skill_content_tool(ctx, args_json: str) -> str:
+            args = json.loads(args_json) if args_json else {}
+            skill_id = args.get("skill_id")
+            if not skill_id:
+                return "Error: skill_id is required."
+            return OrchestratorUtils.read_skill_content(playbooks_dir, str(skill_id))
+
+        async def list_skill_resources_tool(ctx, args_json: str) -> str:
+            args = json.loads(args_json) if args_json else {}
+            skill_id = args.get("skill_id")
+            if not skill_id:
+                return "Error: skill_id is required."
+            return json.dumps(
+                OrchestratorUtils.list_skill_resources(playbooks_dir, str(skill_id)),
+                ensure_ascii=False,
+            )
+
+        async def read_skill_resource_tool(ctx, args_json: str) -> str:
+            args = json.loads(args_json) if args_json else {}
+            skill_id = args.get("skill_id")
+            resource_path = args.get("resource_path")
+            if not skill_id or not resource_path:
+                return "Error: skill_id and resource_path are required."
+            return OrchestratorUtils.read_skill_resource(playbooks_dir, str(skill_id), str(resource_path))
+
+        return [
+            FunctionTool(
+                name="get_skill_manifest",
+                description="Read the structured manifest for a specific skill package by skill_id.",
+                params_json_schema={
+                    "type": "object",
+                    "properties": {
+                        "skill_id": {"type": "string", "description": "Skill ID to inspect."}
+                    },
+                    "required": ["skill_id"],
+                    "additionalProperties": False,
+                },
+                on_invoke_tool=get_skill_manifest_tool,
+            ),
+            FunctionTool(
+                name="read_skill_content",
+                description="Read the SKILL.md content for a specific skill package by skill_id.",
+                params_json_schema={
+                    "type": "object",
+                    "properties": {
+                        "skill_id": {"type": "string", "description": "Skill ID to inspect."}
+                    },
+                    "required": ["skill_id"],
+                    "additionalProperties": False,
+                },
+                on_invoke_tool=read_skill_content_tool,
+            ),
+            FunctionTool(
+                name="list_skill_resources",
+                description="List templates, snippets, examples, assets, and core files bundled with a skill package.",
+                params_json_schema={
+                    "type": "object",
+                    "properties": {
+                        "skill_id": {"type": "string", "description": "Skill ID to inspect."}
+                    },
+                    "required": ["skill_id"],
+                    "additionalProperties": False,
+                },
+                on_invoke_tool=list_skill_resources_tool,
+            ),
+            FunctionTool(
+                name="read_skill_resource",
+                description="Read a specific resource from a skill package, such as a template, snippet, or example.",
+                params_json_schema={
+                    "type": "object",
+                    "properties": {
+                        "skill_id": {"type": "string", "description": "Skill ID to inspect."},
+                        "resource_path": {"type": "string", "description": "Relative path inside the skill package."}
+                    },
+                    "required": ["skill_id", "resource_path"],
+                    "additionalProperties": False,
+                },
+                on_invoke_tool=read_skill_resource_tool,
+            ),
+        ]
 
     async def _build_openai_tools_for_one_agent(
         self,
@@ -485,15 +595,6 @@ class OpenAIMCPBridge(MCPBridgeManager):
                 ensure_ascii=False,
             )
 
-        async def read_skill_resource_tool(ctx, args_json: str) -> str:
-            args = json.loads(args_json) if args_json else {}
-            skill_id = args.get("skill_id")
-            resource_path = args.get("resource_path")
-            if not skill_id or not resource_path:
-                return "Error: skill_id and resource_path are required."
-            self.planner_discovery_log.append(f"read_skill_resource:{skill_id}:{resource_path}")
-            return OrchestratorUtils.read_skill_resource(abs_playbooks_dir, str(skill_id), str(resource_path))
-
         async def list_agents_capabilities_tool(ctx, args_json: str) -> str:
             self.planner_discovery_log.append("list_agents_capabilities")
             return registry_summary
@@ -509,7 +610,8 @@ class OpenAIMCPBridge(MCPBridgeManager):
             "- Treat the selected skill as the workflow contract. Plan steps must come from the skill's ## Steps and ## Required Tools.\n"
             "- If the selected skill references another skill/playbook, call read_skill_content for every referenced skill and expand those concrete steps into the plan.\n"
             "- Do not invent bridge/check steps between compound-skill sections unless a referenced skill explicitly lists them.\n"
-            "- Use list_skill_resources and read_skill_resource only when the skill package includes templates, snippets, examples, or assets that are needed for planning.\n"
+            "- Use list_skill_resources only when the skill package includes templates, snippets, examples, or assets that are needed for planning.\n"
+            "- Do not read resource bodies during planning. If implementation artifacts are needed later, reference them through resource_hints so the executing specialist can read them.\n"
             "- Do not add steps or tools merely because they appear in list_agents_capabilities. Agent capabilities are for validation only.\n"
             "- If the user's request needs a step/tool that is not in the skill, put that limitation in risks instead of adding an unsourced step.\n"
             "- Do not ask for all missing inputs during planning.\n"
@@ -578,20 +680,6 @@ class OpenAIMCPBridge(MCPBridgeManager):
                         "additionalProperties": False,
                     },
                     on_invoke_tool=list_skill_resources_tool,
-                ),
-                FunctionTool(
-                    name="read_skill_resource",
-                    description="Read a specific resource from a skill package, such as a template or example.",
-                    params_json_schema={
-                        "type": "object",
-                        "properties": {
-                            "skill_id": {"type": "string", "description": "Skill ID to inspect."},
-                            "resource_path": {"type": "string", "description": "Relative path inside the skill package."}
-                        },
-                        "required": ["skill_id", "resource_path"],
-                        "additionalProperties": False,
-                    },
-                    on_invoke_tool=read_skill_resource_tool,
                 ),
                 FunctionTool(
                     name="list_agents_capabilities",
@@ -712,6 +800,7 @@ class OpenAIMCPBridge(MCPBridgeManager):
             exclude_agents=exclude_agents,
             include_resource_list_tool=include_resource_list_tool,
             tool_name_style=tool_name_style,
+            playbooks_dir=playbooks_dir,
         )
 
         # 2. Build Planner as a callable tool, not a handoff target.
@@ -764,7 +853,8 @@ class OpenAIMCPBridge(MCPBridgeManager):
             f"{planning_rule}"
             "2. For explicit immediate single-step execution/control requests, such as starting BF preview, getting SEM state, confirming ROI, or stopping preview, hand off to the matching specialist agent.\n"
             "3. Do not call specialist handoff tools to create a PlanReview. After the user approves a PlanReview, execute it by reading each step and handing off to that step's specialist agent.\n"
-            "4. For approved PlanReview execution, follow the plan step order. Each handoff must include the step_id, exact tool_name, arguments, required_inputs, expected_output, on_success, and on_failure.\n"
+            "4. For approved PlanReview execution, follow the plan step order. Each handoff must include the step_id, exact skill, exact tool_name, arguments, resource_hints, required_inputs, expected_output, on_success, and on_failure.\n"
+            "4a. If resource_hints is present, preserve those exact resource paths in the handoff. For code-writing, code-generation, or code-running steps, the specialist must read those skill resources before producing or executing code.\n"
             "5. If a direct specialist/tool is available, never say you lack control access. Route to the specialist instead.\n"
             "6. If the relevant planning or execution route fails, report the failure and stop.\n\n"
             f"{registry_summary}"

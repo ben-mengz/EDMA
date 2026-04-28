@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from agents import Agent, Runner
+from agents.exceptions import MaxTurnsExceeded
 from openai.types.responses import ResponseTextDeltaEvent
 
 from edma_mcp.client.models import PlanReview
@@ -40,6 +41,8 @@ class PlanningCoordinator:
         self.session = None
         self.bridge = None
         self.pending_plan: Optional[PlanReview] = None
+        self.planner_max_turns: int = 30
+        self.classifier_max_turns: int = 6
 
     def bind_runtime(self, triage_agent: Any, planner_agent: Any, session: Any, bridge: Any) -> None:
         self.triage_agent = triage_agent
@@ -240,7 +243,12 @@ class PlanningCoordinator:
     ) -> str:
         if self.bridge is not None and hasattr(self.bridge, "planner_discovery_log"):
             self.bridge.planner_discovery_log = []
-        response = Runner.run_streamed(self.planner_agent, message, session=self.session)
+        response = Runner.run_streamed(
+            self.planner_agent,
+            message,
+            session=self.session,
+            max_turns=self.planner_max_turns,
+        )
         bot_text = []
         live_items = []
         planner_poll_active = True
@@ -265,23 +273,30 @@ class PlanningCoordinator:
         import asyncio
 
         planner_poll_task = asyncio.create_task(poll_planner_discovery())
-        async for event in response.stream_events():
-            if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
-                bot_text.append(event.data.delta)
-            elif event.type == "agent_updated_stream_event":
-                status = f"Agent active: {event.new_agent.name}"
-                if not live_items or live_items[-1] != status:
-                    live_items.append(status)
-                    if callbacks.on_status:
-                        callbacks.on_status(self._compose_live_planning_status(live_label, live_items))
-            elif event.type == "run_item_stream_event":
-                trace_message = trace_formatter(event)
-                if trace_message:
-                    if not live_items or live_items[-1] != trace_message:
-                        live_items.append(trace_message)
+        try:
+            async for event in response.stream_events():
+                if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
+                    bot_text.append(event.data.delta)
+                elif event.type == "agent_updated_stream_event":
+                    status = f"Agent active: {event.new_agent.name}"
+                    if not live_items or live_items[-1] != status:
+                        live_items.append(status)
                         if callbacks.on_status:
                             callbacks.on_status(self._compose_live_planning_status(live_label, live_items))
-        planner_poll_active = False
+                elif event.type == "run_item_stream_event":
+                    trace_message = trace_formatter(event)
+                    if trace_message:
+                        if not live_items or live_items[-1] != trace_message:
+                            live_items.append(trace_message)
+                            if callbacks.on_status:
+                                callbacks.on_status(self._compose_live_planning_status(live_label, live_items))
+        except MaxTurnsExceeded as exc:
+            raise RuntimeError(
+                f"Planner exceeded the turn limit ({self.planner_max_turns}). "
+                "The planning loop likely kept discovering or revising without converging."
+            ) from exc
+        finally:
+            planner_poll_active = False
         try:
             await planner_poll_task
         except Exception:
@@ -291,7 +306,11 @@ class PlanningCoordinator:
     async def _classify_pending_plan_message_async(self, message: str, plan: PlanReview) -> str:
         classifier_agent = self._build_pending_plan_gate_agent()
         prompt = self._format_pending_plan_gate_prompt(message, plan)
-        result = await Runner.run(starting_agent=classifier_agent, input=prompt)
+        result = await Runner.run(
+            starting_agent=classifier_agent,
+            input=prompt,
+            max_turns=self.classifier_max_turns,
+        )
         decision = self._extract_pending_plan_gate_decision(getattr(result, "final_output", result))
         return decision or "wait"
 

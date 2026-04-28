@@ -13,6 +13,7 @@ class SkillContract:
     skill_id: str
     required_tools: List[str]
     ordered_tools: List[str]
+    resource_paths: List[str]
 
 
 def _load_skill_contracts(playbooks_dir: str) -> Dict[str, SkillContract]:
@@ -28,6 +29,10 @@ def _load_skill_contracts(playbooks_dir: str) -> Dict[str, SkillContract]:
             manifest = provider.get_skill_manifest(skill_id)
         except Exception:
             continue
+        try:
+            resources = provider.list_skill_resources(skill_id)
+        except Exception:
+            resources = []
         required_tools = manifest.get("required_tools") or []
         ordered_tools = manifest.get("ordered_tools") or []
         if not isinstance(required_tools, list):
@@ -38,6 +43,7 @@ def _load_skill_contracts(playbooks_dir: str) -> Dict[str, SkillContract]:
             skill_id=skill_id,
             required_tools=[str(tool) for tool in required_tools],
             ordered_tools=[str(tool) for tool in ordered_tools],
+            resource_paths=[str(resource.get("path")) for resource in resources if isinstance(resource, dict) and str(resource.get("path", "")).strip()],
         )
     return contracts
 
@@ -64,38 +70,6 @@ def _normalize_mcp_tools(mcp_tools: Any) -> List[Dict[str, Any]]:
             record["inputSchema"] = schema
         out.append(record)
     return out
-
-
-def _schema_accepts_type(schema: Dict[str, Any], value: Any) -> bool:
-    if not schema:
-        return True
-
-    for union_key in ("anyOf", "oneOf"):
-        options = schema.get(union_key)
-        if isinstance(options, list) and options:
-            return any(_schema_accepts_type(option, value) for option in options if isinstance(option, dict))
-
-    schema_type = schema.get("type")
-    if isinstance(schema_type, list):
-        return any(_schema_accepts_type({"type": one_type}, value) for one_type in schema_type)
-
-    if value is None:
-        return schema_type in {None, "null"}
-    if schema_type in (None, "any"):
-        return True
-    if schema_type == "string":
-        return isinstance(value, str)
-    if schema_type == "integer":
-        return isinstance(value, int) and not isinstance(value, bool)
-    if schema_type == "number":
-        return (isinstance(value, (int, float)) and not isinstance(value, bool))
-    if schema_type == "boolean":
-        return isinstance(value, bool)
-    if schema_type == "array":
-        return isinstance(value, list)
-    if schema_type == "object":
-        return isinstance(value, dict)
-    return True
 
 
 def _is_subsequence(sequence: List[str], ordered: List[str]) -> bool:
@@ -136,9 +110,30 @@ async def judge_plan_review(plan: PlanReview, bridge: Any, playbooks_dir: Option
     async def get_tool_specs(agent_name: str) -> Dict[str, Dict[str, Any]]:
         if agent_name not in tools_by_agent:
             normalized = _normalize_mcp_tools(await bridge.list_tools(agent_name))
-            tools_by_agent[agent_name] = {
+            tool_map = {
                 str(tool.get("name")): tool for tool in normalized if str(tool.get("name", "")).strip()
             }
+            try:
+                resources = await bridge.list_resources(agent_name)
+            except Exception:
+                resources = []
+            if isinstance(resources, list):
+                for resource in resources:
+                    res_name = getattr(resource, "name", None)
+                    if not isinstance(res_name, str) or not res_name.strip():
+                        continue
+                    synthetic_name = f"{agent_name}__read_resource__{res_name.strip()}"
+                    tool_map[synthetic_name] = {
+                        "name": synthetic_name,
+                        "description": f"Synthetic OpenAI resource-read wrapper for agent resource '{res_name}'.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {},
+                            "required": [],
+                            "additionalProperties": False,
+                        },
+                    }
+            tools_by_agent[agent_name] = tool_map
         return tools_by_agent[agent_name]
 
     for step in plan.steps:
@@ -189,45 +184,6 @@ async def judge_plan_review(plan: PlanReview, bridge: Any, playbooks_dir: Option
                 message=f"Step references unavailable tool '{full_tool_name}'.",
             ))
             continue
-
-        schema = tool_spec.get("inputSchema") or tool_spec.get("input_schema") or {}
-        properties = schema.get("properties") if isinstance(schema, dict) else {}
-        if not isinstance(properties, dict):
-            properties = {}
-        required = schema.get("required") if isinstance(schema, dict) else []
-        if not isinstance(required, list):
-            required = []
-
-        for key in required:
-            if key not in step.arguments:
-                issues.append(PlanJudgeIssue(
-                    severity="blocking",
-                    category="parameter",
-                    step_id=step.step_id,
-                    skill=step.skill,
-                    message=f"Missing required parameter '{key}' for tool '{full_tool_name}'.",
-                ))
-
-        for arg_name, arg_value in step.arguments.items():
-            if properties and arg_name not in properties:
-                issues.append(PlanJudgeIssue(
-                    severity="blocking",
-                    category="parameter",
-                    step_id=step.step_id,
-                    skill=step.skill,
-                    message=f"Unexpected parameter '{arg_name}' for tool '{full_tool_name}'.",
-                ))
-                continue
-
-            arg_schema = properties.get(arg_name)
-            if isinstance(arg_schema, dict) and not _schema_accepts_type(arg_schema, arg_value):
-                issues.append(PlanJudgeIssue(
-                    severity="blocking",
-                    category="parameter",
-                    step_id=step.step_id,
-                    skill=step.skill,
-                    message=f"Parameter '{arg_name}' has value '{arg_value}' that does not match the MCP schema for '{full_tool_name}'.",
-                ))
 
     for skill_id, sequence in step_sequences.items():
         contract = contracts.get(skill_id)

@@ -36,6 +36,9 @@ class WorkflowCoordinator:
     def has_pending_plan(self) -> bool:
         return self.planning.has_pending_plan()
 
+    def get_pending_plan(self):
+        return self.planning.get_pending_plan()
+
     def has_paused_execution(self) -> bool:
         return self.execution.has_paused_execution()
 
@@ -44,6 +47,44 @@ class WorkflowCoordinator:
 
     def should_intercept_trigger(self, tool_status: Any) -> bool:
         return self.execution.should_intercept_trigger(tool_status)
+
+    async def approve_pending_plan(
+        self,
+        *,
+        execution_callbacks: ExecutionCallbacks,
+        trace_formatter: Callable[[Any], Optional[str]],
+        handoff_status_extractor: Callable[[str], Optional[str]],
+        execution_status_line_checker: Callable[[str], bool],
+    ) -> WorkflowRoutingResult:
+        plan = self.planning.take_pending_plan()
+        if plan is None:
+            return WorkflowRoutingResult(action="message", message="No pending plan to approve.")
+        await self.execution.execute_plan(
+            plan,
+            execution_callbacks,
+            trace_formatter=trace_formatter,
+            handoff_status_extractor=handoff_status_extractor,
+            execution_status_line_checker=execution_status_line_checker,
+        )
+        return WorkflowRoutingResult(action="handled")
+
+    async def revise_pending_plan(
+        self,
+        message: str,
+        *,
+        planning_callbacks: PlanningCallbacks,
+        trace_formatter: Callable[[Any], Optional[str]],
+        plan_extractor: Callable[[Any], Any],
+    ) -> WorkflowRoutingResult:
+        result = await self.planning.revise_pending_plan(
+            message,
+            callbacks=planning_callbacks,
+            trace_formatter=trace_formatter,
+            plan_extractor=plan_extractor,
+        )
+        if result.error_message:
+            return WorkflowRoutingResult(action="message", message=result.error_message)
+        return WorkflowRoutingResult(action="plan", planning_result=result)
 
     async def handle_user_message(
         self,
@@ -56,7 +97,7 @@ class WorkflowCoordinator:
         handoff_status_extractor: Callable[[str], Optional[str]],
         execution_status_line_checker: Callable[[str], bool],
     ) -> WorkflowRoutingResult:
-        if self.execution.has_paused_execution() and not self._is_new_requirement_message(message):
+        if self.execution.has_paused_execution() and not self._has_explicit_replanning_intent(message):
             await self.execution.resume_execution(
                 message,
                 execution_callbacks,
@@ -193,6 +234,7 @@ class WorkflowCoordinator:
             "workflow",
             "acquire",
             "acquisition",
+            "ptycho",
             "ptychography",
             "4d-stem",
             "defocus",
@@ -217,6 +259,37 @@ class WorkflowCoordinator:
             "\u626b\u63cf",
         }
         return any(keyword in normalized for keyword in planning_keywords)
+
+    def _has_explicit_replanning_intent(self, message: str) -> bool:
+        normalized = self._normalize_plan_message(message)
+        if not normalized:
+            return False
+        explicit_terms = {
+            "plan",
+            "plan again",
+            "replan",
+            "new plan",
+            "new workflow",
+            "workflow",
+            "重新计划",
+            "重新plan",
+            "再计划",
+            "新需求",
+        }
+        if normalized in explicit_terms:
+            return True
+        explicit_patterns = (
+            r"\bplan it\b",
+            r"\bplan again\b",
+            r"\breplan\b",
+            r"\bnew plan\b",
+            r"\bnew workflow\b",
+            r"\bstart a new workflow\b",
+            r"\bmake a plan\b",
+            r"\b重新计划\b",
+            r"\b新需求\b",
+        )
+        return any(re.search(pattern, normalized) for pattern in explicit_patterns)
 
     def _should_arbitrate_pending_plan(self, message: str) -> bool:
         normalized = self._normalize_plan_message(message)

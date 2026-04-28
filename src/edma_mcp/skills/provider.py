@@ -6,6 +6,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from .execution import ResolvedSkillExecution, resolve_skill_execution
+
 
 @dataclass(frozen=True)
 class SkillResource:
@@ -145,6 +147,11 @@ class FilesystemSkillProvider:
         if os.path.isfile(self._content_path(skill_id)):
             return self._build_fallback_manifest(skill_id)
         raise FileNotFoundError(f"Skill manifest not found for '{skill_id}'.")
+
+    def resolve_skill_execution(self, skill_id: str) -> Dict[str, str]:
+        manifest = self.get_skill_manifest(skill_id)
+        resolved: ResolvedSkillExecution = resolve_skill_execution(manifest)
+        return resolved.as_dict()
 
     def read_skill_content(self, skill_id: str) -> str:
         content_path = self._content_path(skill_id)

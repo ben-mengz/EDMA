@@ -43,6 +43,9 @@ def get_orchestrator_instructions(playbooks_dir: str, registry_summary: str = ""
 
 ### ⚠️ OPERATIONAL PROTOCOL
 1. **DISCOVERY FIRST**: You MUST call `list_skills`, `get_skill_manifest`, and `read_skill_content` to understand skill contracts and technical function names. Technical functions are hidden from your default context.
+1a. **DEFAULT READ POLICY**: Treat `manifest.json` and `SKILL.md` as the default planning context. Do not eagerly read solver/template/snippet/example bodies during planning.
+1b. **RESOURCE DISCOVERY ONLY WHEN NEEDED**: Use `list_skill_resources` only when a skill clearly indicates bundled templates/snippets/examples/assets or when you are planning a code-writing or code-running step.
+1c. **RESOURCE BODIES ARE FOR SPECIALISTS**: During planning, do not read resource bodies. Instead, put the relevant resource paths into `resource_hints` on the relevant `PlanStep` so the executing specialist can read them later.
 2. **SKILL IS THE CONTRACT**: After selecting a skill, the plan steps MUST follow that skill's `## Steps` and `## Required Tools`. Do not add steps, tools, validations, waits, checkpoints, or safety checks that are not explicitly present in the selected skill.
 3. **CAPABILITIES ARE VALIDATION ONLY**: Use `list_agents_capabilities` only to confirm that a skill-listed `agent.tool_name` exists. Do not use agent capabilities to invent extra workflow steps.
 4. **EXPAND REFERENCED SKILLS**: If a selected skill references another skill/playbook by id or name, you MUST call `read_skill_content` for every referenced skill and expand those referenced skill steps into concrete PlanSteps. Do not invent bridge/check steps between referenced skills.
@@ -64,7 +67,6 @@ def get_orchestrator_instructions(playbooks_dir: str, registry_summary: str = ""
 - `get_skill_manifest`: Read the structured contract for a skill package.
 - `read_skill_content`: Read technical documentation (MANDATORY before planning).
 - `list_skill_resources`: Inspect templates, snippets, examples, and assets bundled with a skill.
-- `read_skill_resource`: Read a specific template, snippet, example, or asset text resource from a skill package.
 - `list_agents_capabilities`: Inspect discovered MCP agents and exact available tools.
 
 ### 3. PLANREVIEW REQUIREMENTS
@@ -72,6 +74,7 @@ def get_orchestrator_instructions(playbooks_dir: str, registry_summary: str = ""
 - **DRAFT FROM SKILL ONLY**: Construct the logic flow from the selected skill's steps. One PlanStep should correspond to one skill step unless the skill explicitly says a step contains multiple tool calls.
 - **COMPOUND SKILLS**: When a skill says to use another skill, inline the referenced skill's concrete steps and obey its Planning Contract exactly.
 - **TOOL SOURCE**: Every `agent`, `tool_name`, and argument shape must come from the skill's `## Required Tools`. If a useful tool exists in agent capabilities but is absent from the skill, do not include it.
+- **RESOURCE HINTS**: If a step is expected to write code, run code, or use reusable artifacts, fill `resource_hints` with the relevant skill resource paths (templates, snippets, examples). Do not paste those resource contents into the plan.
 - **USER-FACING WORDING**: Fill `user_summary` and `user_steps` in plain language for the user. Do not mention internal agent names, MCP tool names, function names, or raw JSON in those user-facing fields.
 - **USER STEP SHAPE**: Every `user_steps[i].step_id` must match an internal `steps[i].step_id`. For each user step, explain:
   - `action`: what the step will do

@@ -108,6 +108,33 @@ def build_plan_review_payload(
     }
 
 
+def build_plan_live_payload(
+    plan: Optional[PlanReview],
+    *,
+    discovery_log: Optional[List[str]] = None,
+    queued_for_approval: bool = False,
+    error_message: Optional[str] = None,
+    overall_status: str = "queued",
+    overall_message: str = "",
+    current_step: Optional[str] = None,
+    step_states: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    payload = build_plan_review_payload(
+        plan,
+        discovery_log=discovery_log,
+        queued_for_approval=queued_for_approval,
+        error_message=error_message,
+    )
+    payload["kind"] = "plan_live"
+    payload["live"] = {
+        "overall_status": overall_status,
+        "overall_message": overall_message,
+        "current_step": current_step,
+        "steps": dict(step_states or {}),
+    }
+    return payload
+
+
 def build_execution_status_payload(
     *,
     phase: str,
@@ -139,4 +166,57 @@ def build_execution_result_payload(
         "final_message": final_message,
         "completed_steps": list(completed_steps or []),
         "result_items": list(result_items or []),
+    }
+
+
+def build_code_execution_request_payload(
+    *,
+    request_id: str,
+    skill_id: str,
+    profile: str,
+    suggested_code: str,
+    reason: str = "",
+    runner: str = "python",
+    requires_confirmation: bool = True,
+    timeout_s: Optional[int] = None,
+) -> Dict[str, Any]:
+    return {
+        "kind": "code_execution_request",
+        "request_id": request_id,
+        "skill_id": skill_id,
+        "runner": runner,
+        "profile": profile,
+        "suggested_code": suggested_code,
+        "reason": reason,
+        "requires_confirmation": requires_confirmation,
+        "timeout_s": timeout_s,
+    }
+
+
+def build_code_execution_result_payload(
+    *,
+    request_id: str,
+    status: str,
+    executed_code: str,
+    stdout: str = "",
+    stderr: str = "",
+    result: Any = None,
+    variables: Any = None,
+    error: Optional[str] = None,
+    profile: Optional[str] = None,
+    runner: Optional[str] = None,
+) -> Dict[str, Any]:
+    return {
+        "kind": "code_execution_result",
+        "request_id": request_id,
+        "status": status,
+        "ok": status == "success",
+        "executed_code": executed_code,
+        "stdout": stdout,
+        "stderr": stderr,
+        "result": result,
+        "variables": variables,
+        "error": error,
+        "profile": profile,
+        "runner": runner,
     }

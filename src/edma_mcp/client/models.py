@@ -78,6 +78,7 @@ class PlanStep(BaseModel):
     skill: str = Field(..., description="The ID of the skill/playbook to use.")
     tool_name: str = Field(..., description="Exact MCP tool/function name to call on the target agent.")
     arguments: Dict[str, Any] = Field(default_factory=dict, description="JSON-serializable arguments for the MCP tool.")
+    resource_hints: List[str] = Field(default_factory=list, description="Skill package resources the executing specialist should read for this step, such as templates, snippets, or examples.")
     required_inputs: List[str] = Field(default_factory=list, description="Inputs to request only when execution reaches this step.")
     expected_output: str = Field(..., description="Criteria for successful completion of this step.")
     on_success: str = Field(..., description="Next step ID to go to on success (e.g. '2') or 'done'.")
@@ -241,6 +242,31 @@ class PlanExecutionResult(BaseModel):
     completed_steps: List[str] = Field(default_factory=list)
     results: List[StepExecutionResult] = Field(default_factory=list)
     message: str = ""
+
+
+class CodeExecutionRequest(BaseModel):
+    request_id: str
+    skill_id: str
+    runner: str = "python"
+    profile: str
+    suggested_code: str
+    reason: str = ""
+    requires_confirmation: bool = True
+    timeout_s: Optional[int] = None
+
+
+class CodeExecutionResult(BaseModel):
+    request_id: str
+    status: Literal["success", "failed", "cancelled"]
+    ok: bool = False
+    executed_code: str
+    stdout: str = ""
+    stderr: str = ""
+    result: Optional[Any] = None
+    variables: Optional[Any] = None
+    error: Optional[str] = None
+    profile: Optional[str] = None
+    runner: Optional[str] = None
 
 
 class PlanJudgeIssue(BaseModel):
